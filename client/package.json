@@ -1,0 +1,24 @@
+{
+  "name": "word-pong-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5178 --strictPort",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@memdecks/mp-client": "^0.5.0",
+    "@memdecks/mp-types": "^0.7.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.55",
+    "@types/react-dom": "^18.2.19",
+    "@vitejs/plugin-react": "^4.2.1",
+    "typescript": "^5.3.3",
+    "vite": "^5.1.3"
+  }
+}

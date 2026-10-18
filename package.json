@@ -1,0 +1,11 @@
+{
+  "name": "word-pong",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fast paced pvp word studying",
+  "scripts": {
+    "emulator": "cmd /c .claude\\run-emulator.cmd",
+    "test": "npm test --prefix server",
+    "build": "npm run build --prefix server && npm run build --prefix client"
+  }
+}

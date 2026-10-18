@@ -1,0 +1,13 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "emulator",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "emulator"],
+      "env": { "EMU_NO_OPEN": "1" },
+      "port": 4106,
+      "autoPort": false
+    }
+  ]
+}

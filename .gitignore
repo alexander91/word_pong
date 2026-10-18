@@ -1,0 +1,37 @@
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Production
+build
+dist
+
+# Misc
+.DS_Store
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Vite
+client/dist
+client/dist-ssr
+client/*.local
+
+# TypeScript
+server/dist
+server/*.tsbuildinfo
+client/client-dev.err.log
+client/client-dev.log
+server/server-dev.err.log
+server/server-dev.log
+
+# Local agent/tooling state
+.agents/
+.runlogs/
