@@ -14,5 +14,13 @@ running for the user's test session; Ctrl+C stops the complete stack.
 # Rules live on the server
 
 `server/src/module.ts` is authoritative. The client only renders `viewFor` output and sends
-`shoot` / `block` actions. Never send a blocker the shot's concept id or study-language word while
-the ball is in flight — only its meaning. Run `npm test` in `server/` after changing the rules.
+`hit` actions. Never send the receiver the ball's target id or its study-language word while the
+ball is in flight — only its meaning. The ball's `travel` curve exists twice (server
+`module.ts`, client `Game.tsx`); change both together. Run `npm test` in `server/` after
+changing the rules.
+
+# Look
+
+A table-tennis table seen from above, not an arcade: blue table, white lines and net, a white
+ball, cards with a red rubber edge (yours) or black rubber backs (theirs). Sound stays off unless
+the player turns pronunciation on.

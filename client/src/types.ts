@@ -1,9 +1,8 @@
 /** Mirrors the server's `viewFor` output (the `mp:state` payload). */
 
 export type GamePhase = 'PLAYING' | 'GAME_OVER';
-export type Stage = 'ready' | 'aim' | 'flight' | 'result';
-export type Outcome = 'blocked' | 'wrong' | 'missed';
-export type Role = 'shooter' | 'blocker';
+export type Stage = 'ready' | 'flight' | 'pause';
+export type Outcome = 'hit' | 'wrong' | 'missed';
 
 /** Pronunciation source: the player's own card, or a word spoken by text. */
 export type AudioRef = { cardId: string } | { text: string; lang: string };
@@ -16,48 +15,52 @@ export interface PlayerView {
 }
 
 export interface HandCard {
-  /** Concept id — the same on both players' hands. */
+  /** Opaque concept id. */
   id: string;
   /** The word in this viewer's study language. */
   word: string;
   transliteration?: string;
-  /** The meaning in the viewer's own language — only sent once the volley is decided. */
+  /** The meaning in the viewer's own language — only sent once the ball is decided. */
   prompt?: string;
   partOfSpeech: string;
   audio?: AudioRef;
 }
 
+/**
+ * The ball, from this viewer's side of the table. Its position runs 0 (sender's end) → 1
+ * (receiver's end) along `travel(elapsed / duration)`, starting at `startPos`; sideways it moves
+ * from `startX` to `endX` (0–100) on the same curve.
+ */
 export interface BallView {
-  /** Who fired it, from this viewer's side of the table. */
-  from: 'me' | 'opponent';
-  /** The study-language word (shooter, or anyone once decided). */
-  word?: string;
-  /** Its meaning in the viewer's language (blocker, or anyone once decided). */
-  prompt?: string;
+  id: number;
+  direction: 'incoming' | 'outgoing';
+  /** `returned` = the last ball, hit back with no one left to receive it. */
+  state: 'flying' | 'returned' | 'missed';
+  startPos: number;
+  startX: number;
+  endX: number;
+  durationMs: number;
+  /** Time since it left, when the server sent this view. */
+  elapsedMs: number;
+  /** Where along its path it was decided (1 = it reached the receiver untouched). */
+  contactPos: number | null;
+  /** Incoming: the meaning to answer. Outgoing: the word you sent it with. */
+  label?: string;
 }
 
-export interface VolleyView {
-  number: number;
-  total: number;
-  stage: Stage;
-  role: Role | null;
-  shooterId: string;
-  blockerId: string;
-  /** Time left in the current stage when the server sent this view. */
-  remainingMs: number;
-  durationMs: number;
-  hand: HandCard[];
-  shotId: string | null;
-  blockId: string | null;
-  outcome: Outcome | null;
-  autoShot: boolean;
-  ball: BallView | null;
+export interface ResultView {
+  ball: number;
+  outcome: Outcome;
+  /** How long ago it was decided, when the server sent this view. */
+  ageMs: number;
+  /** The right card and the one swung — only on your own result. */
+  target?: HandCard;
+  picked?: HandCard;
 }
 
 export interface HistoryRow {
   number: number;
-  shooterId: string;
-  blockerId: string;
+  receiverId: string;
   outcome: Outcome;
   word: string;
   prompt: string;
@@ -75,7 +78,16 @@ export interface GameState {
   you: string;
   studyLanguage: string | null;
   players: PlayerView[];
-  volley: VolleyView | null;
+  stage: Stage;
+  stageRemainingMs: number;
+  nextServerId: string | null;
+  ballNumber: number;
+  totalBalls: number;
+  hand: HandCard[];
+  opponentHandCount: number;
+  ball: BallView | null;
+  myResult: ResultView | null;
+  opponentResult: ResultView | null;
   winnerId: string | null;
   message: string;
   sound: SoundCue;

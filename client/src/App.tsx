@@ -36,7 +36,7 @@ export default function App() {
 export function Splash({ subtitle }: { subtitle: string }) {
   return (
     <div className="splash">
-      <h1 className="logo">WORD<span>PONG</span></h1>
+      <h1 className="logo"><span className="logo-ball" aria-hidden="true" />Word Pong</h1>
       <p className="splash-subtitle">{subtitle}</p>
     </div>
   );

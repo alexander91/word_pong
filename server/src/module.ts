@@ -2,42 +2,45 @@
  * Word Pong — the GameModule the mp-runtime drives. The runtime owns transport, lobby, auth,
  * card provisioning, and broadcasting; this file is the rules.
  *
- * Two players, one shared pool of word concepts. Every volley both players are dealt the SAME
- * two concepts, each in their own study language. The shooter fires one of them across the
- * court; it flies at the blocker showing its meaning (in the blocker's own language), and the
- * blocker has until it lands to hit it back with the matching card. A correct block scores the
- * blocker a point; a wrong card or a missed ball scores nothing — there are no minus points.
- * Then the roles swap: the blocker serves the next volley. The match ends after every player
- * has served the agreed number of shots; the highest score wins.
+ * A rally of words. Each player holds two cards in their own study language. The ball flies at
+ * a player carrying the meaning of one of THEIR two cards (in their own language); before it
+ * reaches them they swing the matching card at it. A correct hit scores them a point and
+ * reflects the ball straight back — already carrying the meaning of one of the opponent's
+ * cards — so play never stops. A wrong card or a late swing is a miss: no point (there are no
+ * minus points), a moment to show the right answer, then the player who missed serves. Either
+ * way the player who swung is dealt a fresh pair. The ball strictly alternates sides, so both
+ * players receive the same number of balls; after the last one the highest score wins.
  *
- * Cross-language: concepts are keyed by their English word, so a Greek learner can block a
- * Russian learner's shot — each sees the concept in their own study language.
+ * Cross-language: concepts are keyed by their English word, so a Greek learner can rally with
+ * a Russian learner — each sees words in their own study language.
  *
  * `playerId` throughout is the stable per-match userId (survives reconnects).
  */
 import type { CardTranslation, GameModule, GameResult, MatchContext } from '@memdecks/mp-types';
 import { pick, shuffled } from './random';
 
-/** Cards each player holds per volley — the shooter picks one, the blocker must find it. */
+/** Cards in each player's hand — the ball always carries the meaning of one of them. */
 const HAND_SIZE = 2;
 /** Fewest distinct concepts a match needs, pooled from both decks. */
 const MIN_CONCEPTS = 6;
-/** Countdown before the very first serve, so both players are looking at the court. */
+/** Countdown before the very first serve, so both players are looking at the table. */
 const READY_MS = 2_500;
-/** How long the shooter may aim before a random card is fired for them. */
-const AIM_MS = 10_000;
-/** How long a volley's outcome stays on screen before the next serve. */
-const RESULT_MS = 2_600;
+/** After a miss: long enough to see the right answer, short enough to keep the rally going. */
+const MISS_PAUSE_MS = 1_100;
+/** After the last ball, before the result screen. */
+const FINAL_PAUSE_MS = 1_400;
+/** A missed word comes back after this many fresh pairs, for another try. */
+const RETRY_GAP = 3;
 /** How long a disconnected player may stay away before forfeiting the match. */
 const FORFEIT_GRACE_MS = 30_000;
-const DEFAULT_SHOTS_PER_PLAYER = 10;
-/** Ball flight time = the blocker's window to answer. */
+const DEFAULT_BALLS_PER_PLAYER = 10;
+/** Ball flight time = the receiver's window to answer. */
 const SPEEDS = { relaxed: 8_000, normal: 6_000, fast: 4_000 } as const;
 type Speed = keyof typeof SPEEDS;
 
 type Phase = 'PLAYING' | 'GAME_OVER';
-type Stage = 'ready' | 'aim' | 'flight' | 'result';
-type Outcome = 'blocked' | 'wrong' | 'missed';
+type Stage = 'ready' | 'flight' | 'pause';
+type Outcome = 'hit' | 'wrong' | 'missed';
 
 /** One meaning, rendered into every language in the match. */
 interface Concept {
@@ -54,29 +57,45 @@ interface Concept {
   cardIdByPlayer: Record<string, string>;
 }
 
-interface Volley {
-  /** 1-based. */
+/**
+ * The ball in play. Its position along the table runs 0 (sender's end) → 1 (receiver's end) on
+ * the `travel` curve; a return starts where the previous ball was hit, not at the far end.
+ */
+interface Ball {
+  /** 1-based count of balls played this match. */
   number: number;
-  shooterId: string;
-  blockerId: string;
-  /** Concept ids in each player's hand. Same concepts, independently shuffled order. */
-  hands: Record<string, string[]>;
-  stage: Stage;
-  /** Epoch ms when the current stage ends. */
-  until: number;
-  shotId: string | null;
-  blockId: string | null;
+  fromId: string;
+  toId: string;
+  /** The receiver's hand card whose meaning the ball carries. */
+  targetId: string;
+  /** The sender's card that sent it back (shown on the sender's side); null for a serve. */
+  carriedId: string | null;
+  startedAt: number;
+  durationMs: number;
+  startPos: number;
+  /** Lateral position (0–100, seat 0's view of the table) where it starts and where it lands. */
+  startX: number;
+  endX: number;
   outcome: Outcome | null;
-  /** The shooter ran out of aiming time and a random card was fired for them. */
-  autoShot: boolean;
+  /** Where along the table it was decided (1 = it reached the receiver untouched). */
+  contactPos: number | null;
+  pickedId: string | null;
 }
 
-interface VolleyRecord {
+/** A player's most recent decided ball — drives their own feedback and the opponent's swing. */
+interface SwingResult {
+  ball: number;
+  outcome: Outcome;
+  targetId: string;
+  pickedId: string | null;
+  at: number;
+}
+
+interface BallRecord {
   number: number;
-  shooterId: string;
-  blockerId: string;
+  receiverId: string;
   conceptId: string;
-  blockId: string | null;
+  pickedId: string | null;
   outcome: Outcome;
 }
 
@@ -94,13 +113,22 @@ export interface PongState {
   studyLanguages: Record<string, string>;
   baseLanguages: Record<string, string>;
   concepts: Record<string, Concept>;
-  /** Concept ids not yet dealt this cycle; refilled (reshuffled) when it runs dry. */
-  queue: string[];
+  hands: Record<string, string[]>;
+  /** Per player: concept ids not yet dealt this cycle; refilled (reshuffled) when it runs dry. */
+  queues: Record<string, string[]>;
   scores: Record<string, number>;
-  volley: Volley | null;
-  totalVolleys: number;
+  stage: Stage;
+  /** End of the `ready` countdown or the `pause` after a miss. */
+  stageUntil: number | null;
+  /** What happens when the countdown / pause ends. */
+  afterPause: 'serve' | 'finish';
+  /** Who serves when the countdown / pause ends. */
+  nextServerId: string | null;
+  ball: Ball | null;
+  totalBalls: number;
   flightMs: number;
-  history: VolleyRecord[];
+  results: Record<string, SwingResult>;
+  history: BallRecord[];
   phase: Phase;
   winnerId: string | null;
   message: string;
@@ -109,11 +137,37 @@ export interface PongState {
   absentSince: Record<string, number>;
 }
 
-export type PongAction =
-  | { action: 'shoot'; payload?: { cardId?: string } }
-  | { action: 'block'; payload?: { cardId?: string } };
+export type PongAction = { action: 'hit'; payload?: { cardId?: string } };
 
-// ── language + concept helpers ────────────────────────────────────────────────
+// ── flight ──────────────────────────────────────────────────────────────────
+
+/** Ease-out: the ball is over the net in under a third of the window and slows as it nears the
+ *  receiver, so most of the answer time is spent with the ball on their side. The linear part
+ *  keeps it moving at the end (arriving at about a fifth of its starting speed) instead of
+ *  crawling. The client draws the same curve. */
+export function travel(t: number): number {
+  const clamped = Math.min(1, Math.max(0, t));
+  return 0.45 * clamped + 0.55 * (1 - (1 - clamped) ** 3);
+}
+
+function progressAt(ball: Ball, now: number): number {
+  return travel((now - ball.startedAt) / ball.durationMs);
+}
+
+function posAt(ball: Ball, progress: number): number {
+  return ball.startPos + (1 - ball.startPos) * progress;
+}
+
+function xAt(ball: Ball, progress: number): number {
+  return ball.startX + (ball.endX - ball.startX) * progress;
+}
+
+/** Where a ball lands sideways: anywhere but the very edges. */
+function randomLane(): number {
+  return 22 + Math.random() * 56;
+}
+
+// ── language + concept helpers ──────────────────────────────────────────────
 
 function normalize(value: string): string {
   return value.trim().toLocaleLowerCase();
@@ -256,38 +310,45 @@ function promptFor(concept: Concept, base: string): string {
   return (base !== 'en' && concept.promptByLang[base]) || concept.english;
 }
 
-/** Two concepts can share a volley only if no player would see them as the same word — on the
- *  card (study language) or on the ball (base language). */
-function distinguishable(state: PongState, a: Concept, b: Concept): boolean {
-  for (const playerId of state.players) {
-    const lang = state.studyLanguages[playerId] ?? '';
-    const base = state.baseLanguages[playerId] ?? 'en';
-    if (normalize(wordFor(a, lang)?.word ?? '') === normalize(wordFor(b, lang)?.word ?? '')) return false;
-    if (normalize(promptFor(a, base)) === normalize(promptFor(b, base))) return false;
-  }
-  return true;
+/** Two concepts can share a hand only if their owner would not see them as the same word —
+ *  on the card (study language) or on the ball (base language). */
+function distinguishable(state: PongState, playerId: string, a: Concept, b: Concept): boolean {
+  const lang = state.studyLanguages[playerId] ?? '';
+  const base = state.baseLanguages[playerId] ?? 'en';
+  if (normalize(wordFor(a, lang)?.word ?? '') === normalize(wordFor(b, lang)?.word ?? '')) return false;
+  return normalize(promptFor(a, base)) !== normalize(promptFor(b, base));
 }
 
-/** Deal the next volley's concepts: mutually distinguishable, cycling the whole pool before
- *  any concept repeats. */
-function drawHand(state: PongState): string[] {
+/** Deal a player a fresh pair: mutually distinguishable, cycling the whole pool before any
+ *  concept repeats (a missed word is slotted back in sooner — see `retryLater`). */
+function dealHand(state: PongState, playerId: string): void {
   const all = Object.keys(state.concepts);
+  const queue = (state.queues[playerId] ??= []);
   const hand: string[] = [];
   const fits = (id: string) =>
-    !hand.includes(id) && hand.every((h) => distinguishable(state, state.concepts[h]!, state.concepts[id]!));
+    !hand.includes(id) &&
+    hand.every((h) => distinguishable(state, playerId, state.concepts[h]!, state.concepts[id]!));
   while (hand.length < HAND_SIZE) {
-    if (state.queue.length === 0) state.queue = shuffled(all.filter((id) => !hand.includes(id)));
-    const index = state.queue.findIndex(fits);
+    if (queue.length === 0) queue.push(...shuffled(all.filter((id) => !hand.includes(id))));
+    const index = queue.findIndex(fits);
     if (index >= 0) {
-      hand.push(state.queue.splice(index, 1)[0]!);
+      hand.push(queue.splice(index, 1)[0]!);
       continue;
     }
-    // Nothing left in this cycle fits next to the cards already dealt: reach into the full pool.
+    // Nothing left in this cycle fits next to the card already dealt: reach into the full pool.
     const fallback = shuffled(all).find(fits) ?? shuffled(all).find((id) => !hand.includes(id));
     if (!fallback) break;
     hand.push(fallback);
   }
-  return hand;
+  state.hands[playerId] = hand;
+}
+
+/** Bring a missed word back a few pairs later. */
+function retryLater(state: PongState, playerId: string, conceptId: string): void {
+  const queue = (state.queues[playerId] ??= []);
+  const existing = queue.indexOf(conceptId);
+  if (existing >= 0) queue.splice(existing, 1);
+  queue.splice(Math.min(RETRY_GAP * HAND_SIZE - 1, queue.length), 0, conceptId);
 }
 
 function audioFor(state: PongState, concept: Concept, playerId: string): AudioRef | undefined {
@@ -314,73 +375,90 @@ function opponentOf(state: PongState, playerId: string): string | null {
   return state.players.find((id) => id !== playerId) ?? null;
 }
 
-// ── volley flow ───────────────────────────────────────────────────────────────
+// ── rally flow ──────────────────────────────────────────────────────────────
 
-function startVolley(state: PongState, number: number, shooterId: string, stage: 'ready' | 'aim'): void {
-  const blockerId = opponentOf(state, shooterId);
-  if (!blockerId) return;
-  const dealt = drawHand(state);
-  const hands: Record<string, string[]> = {};
-  for (const playerId of state.players) hands[playerId] = shuffled(dealt);
-  state.volley = {
-    number,
-    shooterId,
-    blockerId,
-    hands,
-    stage,
-    until: Date.now() + (stage === 'ready' ? READY_MS : AIM_MS),
-    shotId: null,
-    blockId: null,
+/** Put a ball in flight from `fromId` towards their opponent, aimed at one of the opponent's cards. */
+function launch(
+  state: PongState,
+  fromId: string,
+  from: { carriedId: string | null; startPos: number; startX: number },
+): void {
+  const toId = opponentOf(state, fromId);
+  const targetId = toId ? pick(state.hands[toId] ?? []) : undefined;
+  if (!toId || !targetId) return;
+  state.ball = {
+    number: (state.ball?.number ?? 0) + 1,
+    fromId,
+    toId,
+    targetId,
+    carriedId: from.carriedId,
+    startedAt: Date.now(),
+    durationMs: state.flightMs,
+    startPos: from.startPos,
+    startX: from.startX,
+    endX: randomLane(),
     outcome: null,
-    autoShot: false,
+    contactPos: null,
+    pickedId: null,
   };
-  state.message = stage === 'ready' ? `${nameOf(state, shooterId)} serves first.` : `${nameOf(state, shooterId)} is aiming…`;
+  state.stage = 'flight';
+  state.stageUntil = null;
 }
 
-function shoot(state: PongState, playerId: string, cardId: string, auto = false): void {
-  const v = state.volley;
-  if (state.phase !== 'PLAYING' || !v || v.stage !== 'aim' || v.shooterId !== playerId) return;
-  if (!v.hands[playerId]?.includes(cardId)) return;
-  v.shotId = cardId;
-  v.autoShot = auto;
-  v.stage = 'flight';
-  v.until = Date.now() + state.flightMs;
-  cue(state, playerId, cardId);
-  state.message = auto
-    ? `${nameOf(state, playerId)} ran out of time — a random word flies!`
-    : `${nameOf(state, playerId)} shoots!`;
+function serve(state: PongState, fromId: string): void {
+  launch(state, fromId, { carriedId: null, startPos: 0, startX: 50 });
+  state.message = `${nameOf(state, fromId)} serves.`;
 }
 
-function block(state: PongState, playerId: string, cardId: string): void {
-  const v = state.volley;
-  if (state.phase !== 'PLAYING' || !v || v.stage !== 'flight' || v.blockerId !== playerId) return;
-  if (!v.hands[playerId]?.includes(cardId)) return;
-  v.blockId = cardId;
-  resolveVolley(state, cardId === v.shotId ? 'blocked' : 'wrong');
-}
+/** Settle the ball in flight: score a hit, deal the swinger a fresh pair, and either reflect the
+ *  ball straight back (hit) or pause briefly on the right answer (miss). */
+function decide(state: PongState, outcome: Outcome, pickedId: string | null): void {
+  const ball = state.ball;
+  if (!ball || ball.outcome) return;
+  const now = Date.now();
+  const progress = outcome === 'missed' ? 1 : progressAt(ball, now);
+  const receiverId = ball.toId;
 
-function resolveVolley(state: PongState, outcome: Outcome): void {
-  const v = state.volley;
-  if (!v || !v.shotId) return;
-  v.outcome = outcome;
-  v.stage = 'result';
-  v.until = Date.now() + RESULT_MS;
-  if (outcome === 'blocked') state.scores[v.blockerId] = (state.scores[v.blockerId] ?? 0) + 1;
-  state.history.push({
-    number: v.number,
-    shooterId: v.shooterId,
-    blockerId: v.blockerId,
-    conceptId: v.shotId,
-    blockId: v.blockId,
-    outcome,
-  });
-  // The blocker hears the word they had to find, right or wrong.
-  cue(state, v.blockerId, v.shotId);
-  const blocker = nameOf(state, v.blockerId);
+  ball.outcome = outcome;
+  ball.pickedId = pickedId;
+  ball.contactPos = posAt(ball, progress);
+  if (outcome === 'hit') state.scores[receiverId] = (state.scores[receiverId] ?? 0) + 1;
+  else retryLater(state, receiverId, ball.targetId);
+  state.results[receiverId] = { ball: ball.number, outcome, targetId: ball.targetId, pickedId, at: now };
+  state.history.push({ number: ball.number, receiverId, conceptId: ball.targetId, pickedId, outcome });
+  // The receiver hears the word the ball carried, right or wrong.
+  cue(state, receiverId, ball.targetId);
+  dealHand(state, receiverId);
+
+  const name = nameOf(state, receiverId);
+  const last = ball.number >= state.totalBalls;
+  if (outcome === 'hit' && !last) {
+    // Reflect: the return leaves from where the ball was hit, on the hitter's side of the net.
+    launch(state, receiverId, {
+      carriedId: ball.targetId,
+      startPos: 1 - ball.contactPos,
+      startX: xAt(ball, progress),
+    });
+    state.message = `${name} hit it back! +1`;
+    return;
+  }
+
+  state.stage = 'pause';
+  state.stageUntil = now + (last ? FINAL_PAUSE_MS : MISS_PAUSE_MS);
+  state.afterPause = last ? 'finish' : 'serve';
+  // Whoever missed serves the next ball, so the ball keeps alternating sides.
+  state.nextServerId = receiverId;
   state.message =
-    outcome === 'blocked' ? `${blocker} blocked it! +1`
-      : outcome === 'wrong' ? `${blocker} hit back the wrong word.`
-        : `${blocker} missed the ball.`;
+    outcome === 'hit' ? `${name} hit the last ball! +1`
+      : outcome === 'wrong' ? `${name} swung the wrong word.`
+        : `${name} missed the ball.`;
+}
+
+function hit(state: PongState, playerId: string, cardId: string): void {
+  const ball = state.ball;
+  if (state.phase !== 'PLAYING' || state.stage !== 'flight' || !ball || ball.toId !== playerId) return;
+  if (!state.hands[playerId]?.includes(cardId)) return;
+  decide(state, cardId === ball.targetId ? 'hit' : 'wrong', cardId);
 }
 
 function computeWinner(state: PongState): string | null {
@@ -396,30 +474,19 @@ function finish(state: PongState, message: string, winnerId: string | null = com
   state.phase = 'GAME_OVER';
   state.winnerId = winnerId;
   state.message = message;
-  if (state.volley && state.volley.stage !== 'result') state.volley = null;
+  state.stageUntil = null;
 }
 
-function nextVolley(state: PongState): void {
-  const v = state.volley;
-  if (!v) return;
-  if (v.number >= state.totalVolleys) {
-    finish(state, 'All shots played. Highest score wins.');
-    return;
-  }
-  // Roles swap: the blocker serves next.
-  startVolley(state, v.number + 1, v.blockerId, 'aim');
-}
-
-function readSettings(settings: Record<string, unknown>): { shots: number; flightMs: number } {
-  const shots = Number(settings.shots);
+function readSettings(settings: Record<string, unknown>): { balls: number; flightMs: number } {
+  const balls = Number(settings.shots);
   const speed = String(settings.speed ?? 'normal');
   return {
-    shots: Number.isInteger(shots) && shots > 0 && shots <= 50 ? shots : DEFAULT_SHOTS_PER_PLAYER,
+    balls: Number.isInteger(balls) && balls > 0 && balls <= 50 ? balls : DEFAULT_BALLS_PER_PLAYER,
     flightMs: speed in SPEEDS ? SPEEDS[speed as Speed] : SPEEDS.normal,
   };
 }
 
-// ── module ────────────────────────────────────────────────────────────────────
+// ── module ──────────────────────────────────────────────────────────────────
 
 export const wordPongModule: GameModule<PongState, PongAction> = {
   manifest: {
@@ -430,9 +497,9 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
     settingsSchema: [
       {
         key: 'shots',
-        label: 'Shots per player',
+        label: 'Balls per player',
         type: 'select',
-        default: DEFAULT_SHOTS_PER_PLAYER,
+        default: DEFAULT_BALLS_PER_PLAYER,
         options: [5, 10, 15].map((n) => ({ value: n, label: String(n) })),
       },
       {
@@ -454,7 +521,7 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
     const players = [...ctx.players].sort((a, b) => a.seat - b.seat).map((p) => p.userId);
     const names: Record<string, string> = {};
     for (const p of ctx.players) names[p.userId] = p.name;
-    const { shots, flightMs } = readSettings(ctx.settings);
+    const { balls, flightMs } = readSettings(ctx.settings);
 
     const resolvedStudy = resolveStudyLanguages(ctx, players);
     const studyLanguages: Record<string, string> = {};
@@ -470,11 +537,17 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
       studyLanguages,
       baseLanguages,
       concepts: {},
-      queue: [],
+      hands: {},
+      queues: {},
       scores,
-      volley: null,
-      totalVolleys: shots * players.length,
+      stage: 'ready',
+      stageUntil: null,
+      afterPause: 'serve',
+      nextServerId: players[0] ?? null,
+      ball: null,
+      totalBalls: balls * players.length,
       flightMs,
+      results: {},
       history: [],
       phase: 'GAME_OVER',
       winnerId: null,
@@ -491,25 +564,25 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
       return state;
     }
     for (const concept of concepts) state.concepts[concept.id] = concept;
+    for (const userId of players) dealHand(state, userId);
 
     state.phase = 'PLAYING';
-    startVolley(state, 1, players[0]!, 'ready');
+    state.stageUntil = Date.now() + READY_MS;
+    state.message = `${nameOf(state, players[0])} serves first.`;
     return state;
   },
 
   applyAction(state, playerId, action) {
     const cardId = action.payload?.cardId;
-    if (typeof cardId !== 'string') return;
-    if (action.action === 'shoot') shoot(state, playerId, cardId);
-    else if (action.action === 'block') block(state, playerId, cardId);
+    if (action.action === 'hit' && typeof cardId === 'string') hit(state, playerId, cardId);
   },
 
   viewFor(state, playerId) {
     const lang = state.studyLanguages[playerId] ?? '';
     const base = state.baseLanguages[playerId] ?? 'en';
-    const v = state.volley;
-    const role = !v ? null : v.shooterId === playerId ? ('shooter' as const) : ('blocker' as const);
-    const revealed = v?.stage === 'result';
+    const now = Date.now();
+    // Each player sees themselves at the bottom of the table: seat 1's view is turned around.
+    const mirror = (x: number) => (state.players.indexOf(playerId) === 1 ? 100 - x : x);
 
     const cardView = (conceptId: string, withPrompt: boolean) => {
       const concept = state.concepts[conceptId];
@@ -520,40 +593,56 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
         id: conceptId,
         word: translation?.word ?? concept.english,
         ...(translation?.transliteration ? { transliteration: translation.transliteration } : {}),
-        // The meaning is the answer — only shown once the volley is decided.
+        // The meaning is the answer — only shown once the ball is decided.
         ...(withPrompt ? { prompt: promptFor(concept, base) } : {}),
         partOfSpeech: concept.partOfSpeech,
         ...(audio ? { audio } : {}),
       };
     };
 
-    const hand = (v?.hands[playerId] ?? [])
-      .map((id) => cardView(id, revealed))
+    const hand = (state.hands[playerId] ?? [])
+      .map((id) => cardView(id, false))
       .filter((card) => card !== null);
 
-    // What rides on the ball: the shooter sees the word they fired; the blocker sees only its
-    // meaning until the volley is decided.
-    let ball: Record<string, unknown> | null = null;
-    if (v?.shotId && (v.stage === 'flight' || v.stage === 'result')) {
-      const shot = state.concepts[v.shotId];
-      if (shot) {
-        const showWord = role === 'shooter' || revealed;
-        const showPrompt = role === 'blocker' || revealed;
-        ball = {
-          from: role === 'shooter' ? 'me' : 'opponent',
-          ...(showWord ? { word: wordFor(shot, lang)?.word ?? shot.english } : {}),
-          ...(showPrompt ? { prompt: promptFor(shot, base) } : {}),
-        };
-      }
+    const ball = state.ball;
+    let ballView: Record<string, unknown> | null = null;
+    if (ball && state.phase === 'PLAYING' && state.stage !== 'ready') {
+      const incoming = ball.toId === playerId;
+      const target = state.concepts[ball.targetId];
+      const carried = ball.carriedId ? state.concepts[ball.carriedId] : undefined;
+      // Coming at you: the meaning you must answer. Going away: the word you sent it with.
+      const label = incoming
+        ? target && promptFor(target, base)
+        : carried && (wordFor(carried, lang)?.word ?? carried.english);
+      ballView = {
+        id: ball.number,
+        direction: incoming ? 'incoming' : 'outgoing',
+        state: !ball.outcome ? 'flying' : ball.outcome === 'hit' ? 'returned' : 'missed',
+        startPos: ball.startPos,
+        startX: mirror(ball.startX),
+        endX: mirror(ball.endX),
+        durationMs: ball.durationMs,
+        elapsedMs: Math.max(0, now - ball.startedAt),
+        contactPos: ball.contactPos,
+        ...(label ? { label } : {}),
+      };
     }
 
-    const now = Date.now();
-    const stageDuration = !v ? 0
-      : v.stage === 'ready' ? READY_MS
-        : v.stage === 'aim' ? AIM_MS
-          : v.stage === 'flight' ? state.flightMs
-            : RESULT_MS;
+    const resultView = (userId: string | null, withWords: boolean) => {
+      const result = userId ? state.results[userId] : undefined;
+      if (!result) return null;
+      const target = withWords ? cardView(result.targetId, true) : null;
+      const picked = withWords && result.pickedId ? cardView(result.pickedId, true) : null;
+      return {
+        ball: result.ball,
+        outcome: result.outcome,
+        ageMs: Math.max(0, now - result.at),
+        ...(target ? { target } : {}),
+        ...(picked ? { picked } : {}),
+      };
+    };
 
+    const opponentId = opponentOf(state, playerId);
     return {
       phase: state.phase,
       you: playerId,
@@ -564,38 +653,30 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
         score: state.scores[id] ?? 0,
         present: state.absentSince[id] === undefined,
       })),
-      volley: v
-        ? {
-          number: v.number,
-          total: state.totalVolleys,
-          stage: v.stage,
-          role,
-          shooterId: v.shooterId,
-          blockerId: v.blockerId,
-          remainingMs: Math.max(0, v.until - now),
-          durationMs: stageDuration,
-          hand,
-          // Each side learns the other's pick only once it can no longer help them.
-          shotId: role === 'shooter' || revealed ? v.shotId : null,
-          blockId: role === 'blocker' || revealed ? v.blockId : null,
-          outcome: revealed ? v.outcome : null,
-          autoShot: v.autoShot,
-          ball,
-        }
-        : null,
+      stage: state.stage,
+      stageRemainingMs: state.stageUntil ? Math.max(0, state.stageUntil - now) : 0,
+      nextServerId: state.nextServerId,
+      ballNumber: ball?.number ?? 0,
+      totalBalls: state.totalBalls,
+      hand,
+      opponentHandCount: opponentId ? state.hands[opponentId]?.length ?? 0 : 0,
+      // Never the target's id or its study-language word while it flies — only its meaning.
+      ball: ballView,
+      myResult: resultView(playerId, true),
+      opponentResult: resultView(opponentId, false),
       winnerId: state.winnerId,
       message: state.message,
       sound: state.sound[playerId] ?? { token: 0 },
-      // The end-of-match review: every shot, in this player's languages.
+      // The end-of-match review: every ball, in this player's languages.
       history: state.phase === 'GAME_OVER'
         ? state.history.map((record) => {
           const card = cardView(record.conceptId, true);
           return {
             number: record.number,
-            shooterId: record.shooterId,
-            blockerId: record.blockerId,
+            receiverId: record.receiverId,
             outcome: record.outcome,
-            ...(card ? { word: card.word, prompt: card.prompt ?? '' } : { word: '', prompt: '' }),
+            word: card?.word ?? '',
+            prompt: card?.prompt ?? '',
             ...(card?.audio ? { audio: card.audio } : {}),
           };
         })
@@ -615,7 +696,7 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
     state.message = `${nameOf(state, playerId)} disconnected — forfeits in ${Math.round(FORFEIT_GRACE_MS / 1000)}s unless they return.`;
   },
 
-  /** Advance the volley clock; forfeit a disconnected player past grace. */
+  /** Land an unanswered ball, end a countdown or pause, forfeit a player past grace. */
   tick(state) {
     if (state.phase !== 'PLAYING') return;
     const now = Date.now();
@@ -634,32 +715,24 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
       return;
     }
 
-    const v = state.volley;
-    if (!v || now < v.until) return;
-    switch (v.stage) {
-      case 'ready':
-        v.stage = 'aim';
-        v.until = now + AIM_MS;
-        state.message = `${nameOf(state, v.shooterId)} is aiming…`;
-        return;
-      case 'aim': {
-        const random = pick(v.hands[v.shooterId] ?? []);
-        if (random) shoot(state, v.shooterId, random, true);
-        return;
-      }
-      case 'flight':
-        resolveVolley(state, 'missed');
-        return;
-      case 'result':
-        nextVolley(state);
-        return;
+    if (state.stage === 'flight') {
+      const ball = state.ball;
+      if (ball && now >= ball.startedAt + ball.durationMs) decide(state, 'missed', null);
+      return;
     }
+    if (state.stageUntil === null || now < state.stageUntil) return;
+    if (state.afterPause === 'finish') {
+      finish(state, 'All balls played. Highest score wins.');
+      return;
+    }
+    if (state.nextServerId) serve(state, state.nextServerId);
   },
 
   nextDelayMs(state) {
     if (state.phase !== 'PLAYING') return null;
     const deadlines = Object.values(state.absentSince).map((since) => since + FORFEIT_GRACE_MS);
-    if (state.volley) deadlines.push(state.volley.until);
+    if (state.stage === 'flight' && state.ball) deadlines.push(state.ball.startedAt + state.ball.durationMs);
+    else if (state.stageUntil !== null) deadlines.push(state.stageUntil);
     if (deadlines.length === 0) return null;
     return Math.max(0, Math.min(...deadlines) - Date.now());
   },

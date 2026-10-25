@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import {
   joinMatch, type GameSession, type MatchConnection, type TranslatorBridge,
 } from '@memdecks/mp-client';
 import type { MatchHandoff } from '@memdecks/mp-types';
-import type { BallView, GameState, HandCard, HistoryRow, PlayerView, VolleyView } from '../types';
+import type { BallView, GameState, HandCard, HistoryRow, PlayerView, ResultView } from '../types';
 import { WordAudio } from '../audio/cardAudio';
 import { Splash } from '../App';
+import Potato from '../Potato';
 
 interface Props {
   handoff: MatchHandoff;
@@ -14,25 +15,59 @@ interface Props {
   bridge: TranslatorBridge;
 }
 
-/** Local deadline for the current stage, anchored when its view arrived (no server-clock skew). */
-interface StageClock {
-  key: string;
-  deadline: number;
-  duration: number;
-  startedAt: number;
+/** Local timing for the ball on screen, anchored when its view arrived (no server-clock skew). */
+interface BallAnchor {
+  id: number;
+  /** `performance.now()` at which it leaves (held a moment after a hit, see CONTACT_MS). */
+  start: number;
+  /** `performance.now()` at which its miss / last return starts playing out (0 while flying). */
+  decidedAt: number;
 }
 
-/** How long the outcome animation runs once a volley is decided. */
-const RESULT_ANIM_MS = 900;
+/** Where the ball was when you swung: it waits there for your card instead of flying on. */
+interface Frozen {
+  id: number;
+  x: number;
+  y: number;
+}
 
+interface Point {
+  x: number;
+  y: number;
+}
+
+/** A card swinging out to meet the ball. Drawn above the page so it outlives the hand being
+ *  redealt the moment the server hears about the swing. */
+interface Swing {
+  key: string;
+  side: 'me' | 'opponent';
+  word?: string;
+  from: DOMRect;
+  /** The point on the ball the card's facing edge travels to. */
+  to: Point;
+}
+
+interface Burst {
+  key: string;
+  at: Point;
+  outcome: 'hit' | 'wrong';
+}
+
+/** How long a swinging card takes to reach the ball; the ball waits there for it. */
+const CONTACT_MS = 200;
+/** A missed ball rolling off the end of the table. */
+const AFTERMATH_MS = 650;
+/** How long your "hit / wrong" note stays up. */
+const CHIP_MS = 2_000;
 const SOUND_PREF_KEY = 'word-pong:sound';
+
+const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+/** The server's `travel` curve: fast over the net, slowing as it reaches the receiver. */
+const travel = (t: number) => 0.45 * clamp01(t) + 0.55 * (1 - (1 - clamp01(t)) ** 3);
 
 function readSoundPref(): boolean {
   try { return localStorage.getItem(SOUND_PREF_KEY) === 'on'; } catch { return false; }
 }
-
-const stageKey = (v: VolleyView) => `${v.number}:${v.stage}`;
-const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 
 /** Re-render every animation frame while `active`; returns the current `performance.now()`. */
 function useFrameNow(active: boolean): number {
@@ -47,27 +82,57 @@ function useFrameNow(active: boolean): number {
   return now;
 }
 
+/** Where the ball is on the table: x in %, y as a 0 (far end) → 1 (your end) fraction. */
+function ballGeometry(ball: BallView, anchor: BallAnchor, now: number, frozen: Frozen | null) {
+  if (frozen && frozen.id === ball.id && ball.state === 'flying') return { x: frozen.x, y: frozen.y, opacity: 1 };
+  let pos: number;
+  let x: number;
+  let opacity = 1;
+  if (ball.state === 'flying') {
+    const progress = travel((now - anchor.start) / ball.durationMs);
+    pos = ball.startPos + (1 - ball.startPos) * progress;
+    x = ball.startX + (ball.endX - ball.startX) * progress;
+  } else {
+    const contact = ball.contactPos ?? 1;
+    const span = 1 - ball.startPos || 1;
+    const atContact = ball.startX + (ball.endX - ball.startX) * clamp01((contact - ball.startPos) / span);
+    const r = clamp01((now - anchor.decidedAt) / AFTERMATH_MS);
+    if (ball.state === 'missed') {
+      // Past the receiver and off the end of the table.
+      pos = contact + 0.2 * r;
+      x = atContact + (ball.endX - ball.startX) * 0.2 * r;
+      opacity = 1 - r;
+    } else {
+      // The last ball, hit back with nobody left to receive it.
+      pos = contact - (contact + 0.05) * r;
+      x = atContact + (50 - atContact) * 0.3 * r;
+      opacity = 1 - 0.8 * r;
+    }
+  }
+  return { x, y: ball.direction === 'incoming' ? pos : 1 - pos, opacity };
+}
+
 export default function Game({ handoff, session, bridge }: Props) {
   const [state, setState] = useState<GameState | null>(null);
   const [connError, setConnError] = useState<string | null>(null);
-  const [pendingId, setPendingId] = useState<string | null>(null);
-  const [clock, setClock] = useState<StageClock | null>(null);
-  const connRef = useRef<MatchConnection | null>(null);
-  const audioRef = useRef<WordAudio | null>(null);
-  const lastSoundToken = useRef(0);
-  const prevKeyRef = useRef<string | null>(null);
+  const [anchor, setAnchor] = useState<BallAnchor | null>(null);
+  const [stageDeadline, setStageDeadline] = useState(0);
+  const [frozen, setFrozen] = useState<Frozen | null>(null);
+  const [swungBall, setSwungBall] = useState<number | null>(null);
+  const [swungCardId, setSwungCardId] = useState<string | null>(null);
+  const [swings, setSwings] = useState<Swing[]>([]);
+  const [bursts, setBursts] = useState<Burst[]>([]);
+  const [chip, setChip] = useState<ResultView | null>(null);
   // Pronunciation is opt-in: silent until the player turns it on (remembered per browser).
   const [soundOn, setSoundOn] = useState(readSoundPref);
   const soundOnRef = useRef(soundOn);
-  const toggleSound = useCallback(() => {
-    setSoundOn((on) => {
-      const next = !on;
-      soundOnRef.current = next;
-      try { localStorage.setItem(SOUND_PREF_KEY, next ? 'on' : 'off'); } catch { /* storage blocked */ }
-      if (!next) audioRef.current?.stop();
-      return next;
-    });
-  }, []);
+  const connRef = useRef<MatchConnection | null>(null);
+  const audioRef = useRef<WordAudio | null>(null);
+  const lastSoundToken = useRef(0);
+  const ballRef = useRef<HTMLDivElement | null>(null);
+  const myCardRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const opponentCardRefs = useRef<Array<HTMLDivElement | null>>([]);
+  const seenResults = useRef({ mine: 0, theirs: 0 });
 
   useEffect(() => {
     audioRef.current = new WordAudio(session);
@@ -78,23 +143,26 @@ export default function Game({ handoff, session, bridge }: Props) {
   useEffect(() => {
     const conn = joinMatch<GameState>(handoff, {
       onState: (next) => {
+        const now = performance.now();
         setState(next);
         setConnError(null);
-        const v = next.volley;
-        if (v) {
-          const key = stageKey(v);
-          const now = performance.now();
-          setClock((current) => ({
-            key,
-            deadline: now + v.remainingMs,
-            duration: v.durationMs,
-            // A re-broadcast of the same stage keeps its original start (animations stay smooth).
-            startedAt: current?.key === key ? current.startedAt : now,
-          }));
-          if (prevKeyRef.current !== key) {
-            prevKeyRef.current = key;
-            setPendingId(null);
-          }
+        setStageDeadline(now + next.stageRemainingMs);
+        const ball = next.ball;
+        if (ball) {
+          setAnchor((current) => {
+            if (current && current.id === ball.id) {
+              if (ball.state === 'flying' || current.decidedAt) return current;
+              // Hold a swung-at ball where it was struck until the card gets there.
+              return { ...current, decidedAt: now + ((ball.contactPos ?? 1) < 1 ? CONTACT_MS : 0) };
+            }
+            // A return leaves from where it was hit — once the hitting card has reached it.
+            const hold = ball.startPos > 0 && ball.elapsedMs < CONTACT_MS ? CONTACT_MS : 0;
+            return {
+              id: ball.id,
+              start: now - ball.elapsedMs + hold,
+              decidedAt: ball.state === 'flying' ? 0 : now,
+            };
+          });
         }
         // One-shot pronunciation: play the cued word when the sound token advances.
         if (next.sound.token > lastSoundToken.current) {
@@ -108,6 +176,16 @@ export default function Game({ handoff, session, bridge }: Props) {
     connRef.current = conn;
     return () => { conn.disconnect(); connRef.current = null; };
   }, [handoff]);
+
+  const toggleSound = useCallback(() => {
+    setSoundOn((on) => {
+      const next = !on;
+      soundOnRef.current = next;
+      try { localStorage.setItem(SOUND_PREF_KEY, next ? 'on' : 'off'); } catch { /* storage blocked */ }
+      if (!next) audioRef.current?.stop();
+      return next;
+    });
+  }, []);
 
   // Tell the host the match finished — the platform treats `game:result` as the finished signal.
   // Driven off the state phase so a player who reconnects onto a finished match still reports.
@@ -123,31 +201,93 @@ export default function Game({ handoff, session, bridge }: Props) {
     });
   }, [state, bridge]);
 
-  const volley = state?.phase === 'PLAYING' ? state.volley : null;
-  const actionable =
-    !!volley && !pendingId &&
-    ((volley.role === 'shooter' && volley.stage === 'aim') || (volley.role === 'blocker' && volley.stage === 'flight'));
+  const removeSwing = useCallback((key: string) => setSwings((all) => all.filter((s) => s.key !== key)), []);
+  const removeBurst = useCallback((key: string) => setBursts((all) => all.filter((b) => b.key !== key)), []);
 
-  const act = useCallback((card: HandCard) => {
-    if (!volley || !actionable) return;
-    setPendingId(card.id);
-    connRef.current?.sendAction(volley.role === 'shooter' ? 'shoot' : 'block', { cardId: card.id });
-  }, [volley, actionable]);
+  // Freshly decided balls: your note, a flash where the ball was struck, and — on your screen —
+  // the opponent's card swinging out to meet the ball.
+  useLayoutEffect(() => {
+    if (!state) return;
+    const ballRect = ballRef.current?.getBoundingClientRect();
+    const ballCenter = ballRect && { x: ballRect.left + ballRect.width / 2, y: ballRect.top + ballRect.height / 2 };
 
-  // Keyboard: 1/2, ←/→ or A/D pick the left / right card.
+    const mine = state.myResult;
+    if (mine && mine.ball !== seenResults.current.mine) {
+      seenResults.current.mine = mine.ball;
+      if (mine.ageMs < 1_500) {
+        setChip(mine);
+        if (mine.outcome !== 'missed' && ballCenter) {
+          setBursts((all) => [...all, { key: `me-${mine.ball}`, at: ballCenter, outcome: mine.outcome === 'hit' ? 'hit' : 'wrong' }]);
+        }
+      }
+    }
+
+    const theirs = state.opponentResult;
+    if (theirs && theirs.ball !== seenResults.current.theirs) {
+      seenResults.current.theirs = theirs.ball;
+      const cards = opponentCardRefs.current.filter((el): el is HTMLDivElement => !!el);
+      const card = cards[Math.floor(Math.random() * cards.length)];
+      if (theirs.ageMs < 1_500 && theirs.outcome !== 'missed' && ballRect && ballCenter && card) {
+        setSwings((all) => [...all, {
+          key: `opp-${theirs.ball}`,
+          side: 'opponent',
+          from: card.getBoundingClientRect(),
+          to: { x: ballCenter.x, y: ballRect.top },
+        }]);
+        setBursts((all) => [...all, { key: `opp-${theirs.ball}`, at: ballCenter, outcome: theirs.outcome === 'hit' ? 'hit' : 'wrong' }]);
+      }
+    }
+  }, [state]);
+
   useEffect(() => {
-    if (!volley || !actionable) return;
+    if (!chip) return;
+    const timer = setTimeout(() => setChip(null), Math.max(0, CHIP_MS - chip.ageMs));
+    return () => clearTimeout(timer);
+  }, [chip]);
+
+  // A fresh pair is dealt the moment a ball is decided: none of it has been swung yet.
+  const handKey = state?.hand.map((card) => card.id).join(',') ?? '';
+  useEffect(() => setSwungCardId(null), [handKey]);
+
+  const ball = state?.phase === 'PLAYING' ? state.ball : null;
+  const canSwing =
+    !!state && state.stage === 'flight' && !!ball && ball.direction === 'incoming' &&
+    ball.state === 'flying' && swungBall !== ball.id && anchor?.id === ball.id;
+
+  /** Swing a card at the incoming ball: the card flies out to wherever the ball is now. */
+  const swing = useCallback((card: HandCard, cardEl: HTMLElement | null) => {
+    if (!canSwing || !ball || !anchor) return;
+    const geometry = ballGeometry(ball, anchor, performance.now(), null);
+    setFrozen({ id: ball.id, x: geometry.x, y: geometry.y });
+    setSwungBall(ball.id);
+    setSwungCardId(card.id);
+    const ballRect = ballRef.current?.getBoundingClientRect();
+    if (cardEl && ballRect) {
+      setSwings((all) => [...all, {
+        key: `me-${ball.id}`,
+        side: 'me',
+        word: card.word,
+        from: cardEl.getBoundingClientRect(),
+        to: { x: ballRect.left + ballRect.width / 2, y: ballRect.bottom },
+      }]);
+    }
+    connRef.current?.sendAction('hit', { cardId: card.id });
+  }, [canSwing, ball, anchor]);
+
+  // Keyboard: 1/2, ←/→ or A/D swing the left / right card.
+  useEffect(() => {
+    if (!canSwing || !state) return;
     const onKey = (event: KeyboardEvent) => {
       const index = ['1', 'ArrowLeft', 'a', 'A'].includes(event.key) ? 0
         : ['2', 'ArrowRight', 'd', 'D'].includes(event.key) ? 1 : -1;
-      const card = index >= 0 ? volley.hand[index] : undefined;
+      const card = index >= 0 ? state.hand[index] : undefined;
       if (!card) return;
       event.preventDefault();
-      act(card);
+      swing(card, myCardRefs.current[index] ?? null);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [volley, actionable, act]);
+  }, [canSwing, state, swing]);
 
   if (!state) {
     return <Splash subtitle={connError ?? 'Waiting for your opponent…'} />;
@@ -155,23 +295,75 @@ export default function Game({ handoff, session, bridge }: Props) {
 
   const me = state.players.find((p) => p.id === state.you);
   const opponent = state.players.find((p) => p.id !== state.you);
-  const shown = state.volley;
-  const gameOver = state.phase === 'GAME_OVER';
+  const nameOf = (id: string | null) => state.players.find((p) => p.id === id)?.name ?? 'Player';
+  const playing = state.phase === 'PLAYING';
+  const waitingOnOpponent = playing && state.stage === 'flight' && ball?.direction === 'outgoing';
 
   return (
     <div className="game">
-      <Scoreboard me={me} opponent={opponent} volley={shown} soundOn={soundOn} onToggleSound={toggleSound} />
-      <StageTimer volley={volley} clock={clock} />
+      <Potato />
+      <Scoreboard
+        me={me}
+        opponent={opponent}
+        ballNumber={state.ballNumber}
+        totalBalls={state.totalBalls}
+        soundOn={soundOn}
+        onToggleSound={toggleSound}
+      />
 
-      <div className="court">
-        <OpponentPaddle volley={shown} opponent={opponent} />
-        <Field volley={shown} clock={clock} names={state.players} />
-        <MyPaddle volley={shown} pendingId={pendingId} actionable={actionable} onPick={act} />
+      <div className="arena">
+        <div className={`paddle paddle-opponent ${waitingOnOpponent ? 'is-thinking' : ''}`} aria-label={`${opponent?.name ?? 'Opponent'}'s cards`}>
+          {Array.from({ length: state.opponentHandCount || 2 }, (_, index) => (
+            <div key={index} ref={(el) => { opponentCardRefs.current[index] = el; }} className="word-card is-back" />
+          ))}
+        </div>
+
+        <div className="table">
+          <div className="table-centerline" />
+          <div className="net" />
+          {playing && state.stage === 'ready' && (
+            <ReadyCountdown
+              deadline={stageDeadline}
+              label={state.nextServerId === state.you ? 'You serve first' : `${nameOf(state.nextServerId)} serves first`}
+            />
+          )}
+          {ball && anchor?.id === ball.id && <Ball ballRef={ballRef} ball={ball} anchor={anchor} frozen={frozen} />}
+        </div>
+
+        <div className={`paddle paddle-me ${canSwing ? 'is-ready' : ''}`}>
+          {state.hand.map((card, index) => (
+            <button
+              key={card.id}
+              ref={(el) => { myCardRefs.current[index] = el; }}
+              type="button"
+              className={`word-card ${canSwing ? 'is-actionable' : ''} ${swungCardId === card.id ? 'is-swung' : ''}`}
+              disabled={!canSwing}
+              onClick={(event) => swing(card, event.currentTarget)}
+              aria-label={`Hit with ${card.word}`}
+            >
+              <span className="card-key">{index + 1}</span>
+              <span className="card-word">{card.word}</span>
+              {card.transliteration && <span className="card-translit">{card.transliteration}</span>}
+            </button>
+          ))}
+        </div>
       </div>
 
-      <StatusLine state={state} opponent={opponent} connError={connError} />
+      <StatusLine state={state} opponent={opponent} connError={connError} chip={chip} />
 
-      {gameOver && (
+      <div className="fx-layer" aria-hidden="true">
+        {swings.map((s) => <SwingGhost key={s.key} swing={s} onDone={removeSwing} />)}
+        {bursts.map((b) => (
+          <span
+            key={b.key}
+            className={`burst is-${b.outcome}`}
+            style={{ left: b.at.x, top: b.at.y, animationDelay: `${CONTACT_MS}ms` }}
+            onAnimationEnd={() => removeBurst(b.key)}
+          />
+        ))}
+      </div>
+
+      {state.phase === 'GAME_OVER' && (
         <GameOver
           state={state}
           onPlay={(row) => void audioRef.current?.play(row.audio)}
@@ -185,10 +377,11 @@ export default function Game({ handoff, session, bridge }: Props) {
 
 // ── header ──────────────────────────────────────────────────────────────────
 
-function Scoreboard({ me, opponent, volley, soundOn, onToggleSound }: {
+function Scoreboard({ me, opponent, ballNumber, totalBalls, soundOn, onToggleSound }: {
   me: PlayerView | undefined;
   opponent: PlayerView | undefined;
-  volley: VolleyView | null;
+  ballNumber: number;
+  totalBalls: number;
   soundOn: boolean;
   onToggleSound: () => void;
 }) {
@@ -196,11 +389,11 @@ function Scoreboard({ me, opponent, volley, soundOn, onToggleSound }: {
     <header className="scoreboard">
       <div className="score-side is-me">
         <span className="score-name">{me?.name ?? 'You'}</span>
-        <span className="score-value">{me?.score ?? 0}</span>
+        <span key={me?.score} className="score-value">{me?.score ?? 0}</span>
       </div>
       <div className="score-mid">
-        <span className="score-mid-label">Shot</span>
-        <span className="score-mid-value">{volley ? `${volley.number}/${volley.total}` : '–'}</span>
+        <span className="score-mid-label">Ball</span>
+        <span className="score-mid-value">{ballNumber > 0 ? `${ballNumber} / ${totalBalls}` : `– / ${totalBalls}`}</span>
         <button
           type="button"
           className={`sound-toggle ${soundOn ? 'is-on' : ''}`}
@@ -212,7 +405,7 @@ function Scoreboard({ me, opponent, volley, soundOn, onToggleSound }: {
         </button>
       </div>
       <div className="score-side is-opponent">
-        <span className="score-value">{opponent?.score ?? 0}</span>
+        <span key={opponent?.score} className="score-value">{opponent?.score ?? 0}</span>
         <span className="score-name">
           {opponent?.name ?? 'Opponent'}
           {opponent && !opponent.present && <em className="score-away"> · away</em>}
@@ -222,125 +415,11 @@ function Scoreboard({ me, opponent, volley, soundOn, onToggleSound }: {
   );
 }
 
-/** Countdown bar for the shooter's aim window and the blocker's flight window. */
-function StageTimer({ volley, clock }: { volley: VolleyView | null; clock: StageClock | null }) {
-  const running = !!volley && !!clock && (volley.stage === 'aim' || volley.stage === 'flight');
-  const now = useFrameNow(running);
-  if (!running || !clock) return <div className="stage-timer is-idle" />;
-  const fraction = clock.duration > 0 ? clamp01((clock.deadline - now) / clock.duration) : 0;
-  const mine = (volley.role === 'shooter' && volley.stage === 'aim') || (volley.role === 'blocker' && volley.stage === 'flight');
-  return (
-    <div className={`stage-timer ${mine ? 'is-mine' : ''} ${fraction < 0.3 ? 'is-low' : ''}`}>
-      <div className="stage-timer-bar" style={{ transform: `scaleX(${fraction})` }} />
-    </div>
-  );
-}
+// ── table ───────────────────────────────────────────────────────────────────
 
-// ── court ───────────────────────────────────────────────────────────────────
-
-function OpponentPaddle({ volley, opponent }: { volley: VolleyView | null; opponent: PlayerView | undefined }) {
-  const count = volley?.hand.length ?? 2;
-  const decided = volley?.stage === 'result';
-  // Both players hold the same concepts, so the opponent's pick can be shown from our own hand.
-  const raised = decided && volley.role === 'shooter' && volley.blockId
-    ? volley.hand.find((c) => c.id === volley.blockId)
-    : undefined;
-  const thinking =
-    !!volley && ((volley.role === 'blocker' && volley.stage === 'aim') || (volley.role === 'shooter' && volley.stage === 'flight'));
-  // The opponent's fired card has left their paddle — it is the ball.
-  const fired = volley?.ball?.from === 'opponent';
-  return (
-    <div className={`paddle paddle-opponent ${thinking ? 'is-thinking' : ''}`} aria-label={`${opponent?.name ?? 'Opponent'}'s cards`}>
-      {Array.from({ length: count }, (_, index) => {
-        const showRaised = index === 0 && raised;
-        const correct = showRaised && volley?.outcome === 'blocked';
-        return (
-          <div
-            key={index}
-            className={[
-              'word-card is-back',
-              showRaised ? `is-raised ${correct ? 'is-correct' : 'is-wrong'}` : '',
-              fired && index === 0 ? 'is-empty' : '',
-            ].filter(Boolean).join(' ')}
-          >
-            {showRaised ? <span className="card-word">{raised.word}</span> : <span className="card-back-mark">?</span>}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function MyPaddle({ volley, pendingId, actionable, onPick }: {
-  volley: VolleyView | null;
-  pendingId: string | null;
-  actionable: boolean;
-  onPick: (card: HandCard) => void;
-}) {
-  if (!volley) return <div className="paddle paddle-me" />;
-  const decided = volley.stage === 'result';
-  const mode = volley.role === 'shooter' ? 'shoot' : 'block';
-  return (
-    <div className={`paddle paddle-me ${actionable ? `is-${mode}-ready` : ''}`}>
-      {volley.hand.map((card, index) => {
-        const isShot = card.id === volley.shotId;
-        const isBlock = card.id === volley.blockId;
-        const classes = [
-          'word-card',
-          actionable ? 'is-actionable' : '',
-          pendingId === card.id ? 'is-pending' : '',
-          volley.role === 'shooter' && isShot && !decided ? 'is-fired' : '',
-          decided && isShot ? 'is-correct' : '',
-          decided && isBlock && !isShot ? 'is-wrong' : '',
-          decided && !isShot && !isBlock ? 'is-dim' : '',
-        ].filter(Boolean).join(' ');
-        return (
-          <button
-            key={card.id}
-            type="button"
-            className={classes}
-            disabled={!actionable}
-            onClick={() => onPick(card)}
-            aria-label={`${mode === 'shoot' ? 'Shoot' : 'Block with'} ${card.word}`}
-          >
-            <span className="card-key">{index + 1}</span>
-            <span className="card-word">{card.word}</span>
-            {card.transliteration && <span className="card-translit">{card.transliteration}</span>}
-            {card.prompt && <span className="card-prompt">{card.prompt}</span>}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function Field({ volley, clock, names }: { volley: VolleyView | null; clock: StageClock | null; names: PlayerView[] }) {
-  const nameOf = (id: string | undefined) => names.find((p) => p.id === id)?.name ?? 'Player';
-  return (
-    <div className="field">
-      <div className="net" />
-      {volley?.stage === 'ready' && (
-        <ReadyCountdown
-          clock={clock}
-          label={volley.role === 'shooter' ? 'You serve first' : `${nameOf(volley.shooterId)} serves first`}
-        />
-      )}
-      {volley?.stage === 'aim' && (
-        <div className="field-hint">
-          {volley.role === 'shooter'
-            ? <>Your serve — <strong>tap a word</strong> to shoot it</>
-            : <>{nameOf(volley.shooterId)} is aiming…</>}
-        </div>
-      )}
-      {volley?.ball && clock && <Ball volley={volley} ball={volley.ball} clock={clock} />}
-      {volley?.stage === 'result' && <ResultBanner volley={volley} blockerName={nameOf(volley.blockerId)} />}
-    </div>
-  );
-}
-
-function ReadyCountdown({ clock, label }: { clock: StageClock | null; label: string }) {
-  const now = useFrameNow(!!clock);
-  const seconds = clock ? Math.max(1, Math.ceil((clock.deadline - now) / 1000)) : 3;
+function ReadyCountdown({ deadline, label }: { deadline: number; label: string }) {
+  const now = useFrameNow(true);
+  const seconds = Math.max(1, Math.ceil((deadline - now) / 1000));
   return (
     <div className="ready">
       <div className="ready-label">{label}</div>
@@ -349,85 +428,106 @@ function ReadyCountdown({ clock, label }: { clock: StageClock | null; label: str
   );
 }
 
-/**
- * The word in flight. Position runs 0 (shooter's paddle) → 1 (blocker's paddle) over the flight
- * window; once decided it bounces back (blocked), punches through (wrong), or drops (missed).
- */
-function Ball({ volley, ball, clock }: { volley: VolleyView; ball: BallView; clock: StageClock }) {
-  const decided = volley.stage === 'result';
+function Ball({ ballRef, ball, anchor, frozen }: {
+  ballRef: RefObject<HTMLDivElement>;
+  ball: BallView;
+  anchor: BallAnchor;
+  frozen: Frozen | null;
+}) {
   const now = useFrameNow(true);
-  const lastPos = useRef(0);
-  const seed = (volley.number * 1.7) % (Math.PI * 2);
-
-  let pos: number;
-  let opacity = 1;
-  if (!decided) {
-    pos = clock.duration > 0 ? clamp01(1 - (clock.deadline - now) / clock.duration) : 0;
-    lastPos.current = pos;
-  } else {
-    const r = clamp01((now - clock.startedAt) / RESULT_ANIM_MS);
-    const reach = Math.min(1, r / 0.25);
-    const after = clamp01((r - 0.25) / 0.75);
-    const toPaddle = lastPos.current + (1 - lastPos.current) * reach;
-    if (volley.outcome === 'blocked') {
-      pos = r < 0.25 ? toPaddle : 1 - after * 0.85;
-    } else if (volley.outcome === 'wrong') {
-      pos = r < 0.25 ? toPaddle : 1 + after * 0.12;
-      opacity = 1 - after * 0.75;
-    } else {
-      pos = 1 + r * 0.06;
-      opacity = 1 - r * 0.75;
-    }
-  }
-
-  const y = ball.from === 'opponent' ? pos : 1 - pos;
-  const x = 50 + Math.sin(pos * Math.PI * 2 + seed) * 16;
-  // The blocker reads the meaning; the shooter tracks the word they fired.
-  const label = volley.role === 'blocker' ? ball.prompt : ball.word;
+  const { x, y, opacity } = ballGeometry(ball, anchor, now, frozen);
+  const classes = ['ball', ball.label ? '' : 'is-plain', ball.direction === 'incoming' ? 'is-incoming' : 'is-outgoing', `is-${ball.state}`];
   return (
     <div
-      className={`ball ${decided ? `is-${volley.outcome}` : ''}`}
-      style={{ top: `${y * 100}%`, left: `${x}%`, opacity }}
+      ref={ballRef}
+      className={classes.filter(Boolean).join(' ')}
+      style={{ left: `${x}%`, top: `${y * 100}%`, opacity }}
     >
-      <span className="ball-label">{label}</span>
+      {ball.label && <span className="ball-label">{ball.label}</span>}
     </div>
   );
 }
 
-function ResultBanner({ volley, blockerName }: { volley: VolleyView; blockerName: string }) {
-  const iBlocked = volley.role === 'blocker';
-  const shot = volley.hand.find((c) => c.id === volley.shotId);
-  const title =
-    volley.outcome === 'blocked' ? (iBlocked ? 'Blocked! +1' : `${blockerName} blocked it`)
-      : volley.outcome === 'wrong' ? 'Wrong word'
-        : iBlocked ? 'Too slow!' : `${blockerName} missed`;
+/** Your note after each ball: the word you needed, and what you swung if it was wrong. */
+function ResultChip({ result }: { result: ResultView }) {
+  const { target, picked, outcome } = result;
+  if (!target) return null;
   return (
-    <div className={`result-banner is-${volley.outcome}`}>
-      <div className="result-title">{title}</div>
-      {shot && (
-        <div className="result-pair">
-          <span className="result-word">{shot.word}</span>
-          <span className="result-eq">=</span>
-          <span className="result-prompt">{shot.prompt}</span>
-        </div>
+    <div className={`result-chip is-${outcome}`} role="status">
+      {outcome === 'hit' && <span className="chip-head">+1</span>}
+      {outcome === 'wrong' && picked && (
+        <span className="chip-line is-wrong">
+          <s>{picked.word}</s> <span className="chip-meaning">{picked.prompt}</span>
+        </span>
       )}
+      {outcome === 'missed' && <span className="chip-head">Too late</span>}
+      <span className="chip-line">
+        <strong>{target.word}</strong> <span className="chip-meaning">{target.prompt}</span>
+      </span>
+    </div>
+  );
+}
+
+/** A card flying out to meet the ball and falling back. Its facing edge travels to `to`. */
+function SwingGhost({ swing, onDone }: { swing: Swing; onDone: (key: string) => void }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const { from, to, side } = swing;
+    const edgeY = side === 'me' ? from.top : from.bottom;
+    const dx = to.x - (from.left + from.width / 2);
+    const dy = to.y - edgeY;
+    const tilt = side === 'me' ? -7 : 7;
+    const animation = el.animate(
+      [
+        { transform: 'translate(0, 0) rotate(0) scale(1)', opacity: 1 },
+        { transform: `translate(${dx}px, ${dy}px) rotate(${tilt}deg) scale(0.72)`, opacity: 1, offset: 0.4 },
+        { transform: `translate(${dx * 0.3}px, ${dy * 0.3}px) rotate(0) scale(0.8)`, opacity: 0 },
+      ],
+      { duration: CONTACT_MS / 0.4, easing: 'cubic-bezier(.2, .7, .3, 1)' },
+    );
+    animation.onfinish = () => onDone(swing.key);
+    return () => animation.cancel();
+  }, [swing, onDone]);
+  const { from, side } = swing;
+  return (
+    <div
+      ref={ref}
+      className={`swing word-card ${side === 'me' ? 'is-mine' : 'is-back'}`}
+      style={{
+        left: from.left,
+        top: from.top,
+        width: from.width,
+        height: from.height,
+        transformOrigin: side === 'me' ? 'center top' : 'center bottom',
+      }}
+    >
+      {swing.word && <span className="card-word">{swing.word}</span>}
     </div>
   );
 }
 
 // ── footer + overlay ────────────────────────────────────────────────────────
 
-function StatusLine({ state, opponent, connError }: { state: GameState; opponent: PlayerView | undefined; connError: string | null }) {
-  const v = state.volley;
+/** Under your cards: your note on the last ball while it is fresh, otherwise what is going on.
+ *  It sits here rather than on the table so it never covers the ball. */
+function StatusLine({ state, opponent, connError, chip }: {
+  state: GameState;
+  opponent: PlayerView | undefined;
+  connError: string | null;
+  chip: ResultView | null;
+}) {
+  const ball = state.ball;
   let text = state.message;
-  if (state.phase === 'PLAYING' && v?.role === 'blocker' && v.stage === 'flight' && v.ball?.prompt) {
-    text = `Incoming! Hit back the word for “${v.ball.prompt}”`;
-  } else if (state.phase === 'PLAYING' && v?.role === 'shooter' && v.stage === 'flight') {
-    text = `${opponent?.name ?? 'Opponent'} is blocking…`;
+  if (state.phase === 'PLAYING' && state.stage === 'flight' && ball?.state === 'flying') {
+    text = ball.direction === 'incoming'
+      ? `Hit it with the word for “${ball.label ?? '…'}”`
+      : `${opponent?.name ?? 'Opponent'} is answering…`;
   }
   return (
     <footer className={`status ${connError ? 'is-error' : ''}`}>
-      {connError ?? text}
+      {connError ?? (chip?.target ? <ResultChip result={chip} /> : text)}
     </footer>
   );
 }
@@ -441,8 +541,8 @@ function GameOver({ state, onPlay, onRematch, onExit }: {
   const winner = state.players.find((p) => p.id === state.winnerId);
   const cancelled = state.history.length === 0;
   const title = cancelled ? 'No match' : !winner ? 'Draw' : winner.id === state.you ? 'You win!' : `${winner.name} wins`;
-  const myBlocks = state.history.filter((row) => row.blockerId === state.you);
-  const correct = myBlocks.filter((row) => row.outcome === 'blocked').length;
+  const mine = state.history.filter((row) => row.receiverId === state.you);
+  const hits = mine.filter((row) => row.outcome === 'hit').length;
   return (
     <div className="overlay">
       <div className="overlay-card">
@@ -456,11 +556,11 @@ function GameOver({ state, onPlay, onRematch, onExit }: {
                 <span key={p.id} className={p.id === state.you ? 'is-me' : ''}>{p.name} <strong>{p.score}</strong></span>
               ))}
             </div>
-            <p className="overlay-text">You blocked {correct} of {myBlocks.length}. {state.message}</p>
+            <p className="overlay-text">You hit {hits} of {mine.length} balls.</p>
             <ul className="review">
-              {myBlocks.map((row) => (
+              {mine.map((row) => (
                 <li key={row.number} className={`review-row is-${row.outcome}`}>
-                  <span className="review-mark">{row.outcome === 'blocked' ? '✓' : '✗'}</span>
+                  <span className="review-mark">{row.outcome === 'hit' ? '✓' : '✗'}</span>
                   <span className="review-word">{row.word}</span>
                   <span className="review-prompt">{row.prompt}</span>
                   {row.audio && (
