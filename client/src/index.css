@@ -197,7 +197,9 @@ button { font: inherit; color: inherit; }
 .table {
   position: relative;
   flex: 1;
-  min-height: 200px;
+  /* The table gives up height first: on a short screen a 200px floor pushed your cards
+     under the status line, out of reach (Translator-app#733). */
+  min-height: 96px;
   border-radius: 6px;
   background: linear-gradient(180deg, var(--table) 0%, var(--table-deep) 100%);
   /* The white edge lines, then the table's shadow on the floor. */
@@ -574,6 +576,9 @@ button.word-card:disabled { color: var(--ink); }
 .btn-ghost:hover { border-color: var(--ink); }
 
 @media (max-height: 560px) {
+  .game { padding: 8px 12px 4px; gap: 6px; }
+  .arena { gap: 6px; }
+  .status { height: 40px; }
   .word-card { min-height: 60px; padding: 8px; }
   .word-card.is-back { min-height: 40px; }
 }
