@@ -9,7 +9,8 @@ Translator cards.
 
 1. Two players join a match. Both players' decks are pooled into one set of words, keyed by
    meaning, so players studying different languages can play each other.
-2. Each player holds **two cards**, shown in their own study language.
+2. Each player holds **two cards**, shown in their own study language. Point at a card to see its
+   transliteration.
 3. The ball flies at you carrying the *meaning* of one of your two cards (in your own language).
    Before it reaches your end of the table, tap the card with the matching word: the card swings
    out to the ball.

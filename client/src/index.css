@@ -379,7 +379,17 @@ button { font: inherit; color: inherit; }
   overflow-wrap: anywhere;
 }
 
-.card-translit { font-size: 12px; color: var(--muted); }
+/* Transliteration is a hint: it keeps its line (so the card never resizes) but only shows while
+   you point at the card, or focus it from the keyboard. */
+.card-translit {
+  font-size: 12px;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.word-card:hover .card-translit,
+.word-card:focus-visible .card-translit { opacity: 1; }
 
 .card-key {
   position: absolute;
