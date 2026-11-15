@@ -4,12 +4,14 @@
  *
  * A rally of words. Each player holds two cards in their own study language. The ball flies at
  * a player carrying the meaning of one of THEIR two cards (in their own language); before it
- * reaches them they swing the matching card at it. A correct hit scores them a point and
- * reflects the ball straight back — already carrying the meaning of one of the opponent's
- * cards — so play never stops. A wrong card or a late swing is a miss: no point (there are no
- * minus points), a moment to show the right answer, then the player who missed serves. Either
- * way the player who swung is dealt a fresh pair. The ball strictly alternates sides, so both
- * players receive the same number of balls; after the last one the highest score wins.
+ * reaches them they swing the matching card at it. A correct hit reflects the ball straight
+ * back — already carrying the meaning of one of the opponent's cards — so play never stops. A
+ * wrong card or a late swing is a miss: the OTHER player scores a point, a moment shows the right
+ * answer, then the player who missed serves. Either way the player who swung is dealt a fresh
+ * pair, and the ball strictly alternates sides.
+ *
+ * First to `pointsToWin` (3 / 5 / 10) wins. A match also stops after WORD_LIMIT words: the
+ * leader wins, and level scores (a rally nobody missed) are a draw.
  *
  * Cross-language: concepts are keyed by their English word, so a Greek learner can rally with
  * a Russian learner — each sees words in their own study language.
@@ -27,13 +29,17 @@ const MIN_CONCEPTS = 6;
 const READY_MS = 2_500;
 /** After a miss: long enough to see the right answer, short enough to keep the rally going. */
 const MISS_PAUSE_MS = 1_100;
-/** After the last ball, before the result screen. */
+/** After the deciding ball, before the result screen. */
 const FINAL_PAUSE_MS = 1_400;
 /** A missed word comes back after this many fresh pairs, for another try. */
 const RETRY_GAP = 3;
 /** How long a disconnected player may stay away before forfeiting the match. */
 const FORFEIT_GRACE_MS = 30_000;
-const DEFAULT_BALLS_PER_PLAYER = 10;
+/** Points that win the match. You score one whenever your opponent misses. */
+const DEFAULT_POINTS_TO_WIN = 5;
+const POINTS_OPTIONS = [3, 5, 10] as const;
+/** Words (balls) a match may last before it is decided on points. */
+const WORD_LIMIT = 100;
 /** Ball flight time = the receiver's window to answer. */
 const SPEEDS = { relaxed: 8_000, normal: 6_000, fast: 4_000 } as const;
 type Speed = keyof typeof SPEEDS;
@@ -116,7 +122,9 @@ export interface PongState {
   hands: Record<string, string[]>;
   /** Per player: concept ids not yet dealt this cycle; refilled (reshuffled) when it runs dry. */
   queues: Record<string, string[]>;
+  /** Points, one per opponent miss. */
   scores: Record<string, number>;
+  pointsToWin: number;
   stage: Stage;
   /** End of the `ready` countdown or the `pause` after a miss. */
   stageUntil: number | null;
@@ -125,7 +133,7 @@ export interface PongState {
   /** Who serves when the countdown / pause ends. */
   nextServerId: string | null;
   ball: Ball | null;
-  totalBalls: number;
+  wordLimit: number;
   flightMs: number;
   results: Record<string, SwingResult>;
   history: BallRecord[];
@@ -410,20 +418,23 @@ function serve(state: PongState, fromId: string): void {
   state.message = `${nameOf(state, fromId)} serves.`;
 }
 
-/** Settle the ball in flight: score a hit, deal the swinger a fresh pair, and either reflect the
- *  ball straight back (hit) or pause briefly on the right answer (miss). */
+/** Settle the ball in flight: deal the swinger a fresh pair, and either reflect the ball straight
+ *  back (hit) or give the sender the point and pause briefly on the right answer (miss). */
 function decide(state: PongState, outcome: Outcome, pickedId: string | null): void {
   const ball = state.ball;
   if (!ball || ball.outcome) return;
   const now = Date.now();
   const progress = outcome === 'missed' ? 1 : progressAt(ball, now);
   const receiverId = ball.toId;
+  const senderId = ball.fromId;
 
   ball.outcome = outcome;
   ball.pickedId = pickedId;
   ball.contactPos = posAt(ball, progress);
-  if (outcome === 'hit') state.scores[receiverId] = (state.scores[receiverId] ?? 0) + 1;
-  else retryLater(state, receiverId, ball.targetId);
+  if (outcome !== 'hit') {
+    state.scores[senderId] = (state.scores[senderId] ?? 0) + 1;
+    retryLater(state, receiverId, ball.targetId);
+  }
   state.results[receiverId] = { ball: ball.number, outcome, targetId: ball.targetId, pickedId, at: now };
   state.history.push({ number: ball.number, receiverId, conceptId: ball.targetId, pickedId, outcome });
   // The receiver hears the word the ball carried, right or wrong.
@@ -431,7 +442,8 @@ function decide(state: PongState, outcome: Outcome, pickedId: string | null): vo
   dealHand(state, receiverId);
 
   const name = nameOf(state, receiverId);
-  const last = ball.number >= state.totalBalls;
+  const won = outcome !== 'hit' && (state.scores[senderId] ?? 0) >= state.pointsToWin;
+  const last = ball.number >= state.wordLimit;
   if (outcome === 'hit' && !last) {
     // Reflect: the return leaves from where the ball was hit, on the hitter's side of the net.
     launch(state, receiverId, {
@@ -439,19 +451,19 @@ function decide(state: PongState, outcome: Outcome, pickedId: string | null): vo
       startPos: 1 - ball.contactPos,
       startX: xAt(ball, progress),
     });
-    state.message = `${name} hit it back! +1`;
+    state.message = `${name} returns.`;
     return;
   }
 
+  const over = won || last;
   state.stage = 'pause';
-  state.stageUntil = now + (last ? FINAL_PAUSE_MS : MISS_PAUSE_MS);
-  state.afterPause = last ? 'finish' : 'serve';
+  state.stageUntil = now + (over ? FINAL_PAUSE_MS : MISS_PAUSE_MS);
+  state.afterPause = over ? 'finish' : 'serve';
   // Whoever missed serves the next ball, so the ball keeps alternating sides.
   state.nextServerId = receiverId;
   state.message =
-    outcome === 'hit' ? `${name} hit the last ball! +1`
-      : outcome === 'wrong' ? `${name} swung the wrong word.`
-        : `${name} missed the ball.`;
+    outcome === 'hit' ? `${name} returns the last word.`
+      : `${name} ${outcome === 'wrong' ? 'swung the wrong word' : 'was too late'}. Point to ${nameOf(state, senderId)}.`;
 }
 
 function hit(state: PongState, playerId: string, cardId: string): void {
@@ -470,6 +482,17 @@ function computeWinner(state: PongState): string | null {
   return aScore > bScore ? a : b;
 }
 
+/** The closing line once the match is decided on the table (not by a forfeit). */
+function finalMessage(state: PongState): string {
+  const score = (id: string | null | undefined) => (id ? state.scores[id] ?? 0 : 0);
+  const winnerId = computeWinner(state);
+  const [a, b] = winnerId ? [winnerId, opponentOf(state, winnerId)] : state.players;
+  const line = `${score(a)}–${score(b)}`;
+  if (winnerId && score(winnerId) >= state.pointsToWin) return `${nameOf(state, winnerId)} wins ${line}.`;
+  if (winnerId) return `${state.wordLimit} words played. ${nameOf(state, winnerId)} wins ${line}.`;
+  return `${state.wordLimit} words played. Draw at ${line}.`;
+}
+
 function finish(state: PongState, message: string, winnerId: string | null = computeWinner(state)): void {
   state.phase = 'GAME_OVER';
   state.winnerId = winnerId;
@@ -477,11 +500,11 @@ function finish(state: PongState, message: string, winnerId: string | null = com
   state.stageUntil = null;
 }
 
-function readSettings(settings: Record<string, unknown>): { balls: number; flightMs: number } {
-  const balls = Number(settings.shots);
+function readSettings(settings: Record<string, unknown>): { pointsToWin: number; flightMs: number } {
+  const points = Number(settings.points);
   const speed = String(settings.speed ?? 'normal');
   return {
-    balls: Number.isInteger(balls) && balls > 0 && balls <= 50 ? balls : DEFAULT_BALLS_PER_PLAYER,
+    pointsToWin: Number.isInteger(points) && points > 0 && points <= 21 ? points : DEFAULT_POINTS_TO_WIN,
     flightMs: speed in SPEEDS ? SPEEDS[speed as Speed] : SPEEDS.normal,
   };
 }
@@ -496,11 +519,11 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
     maxPlayers: 2,
     settingsSchema: [
       {
-        key: 'shots',
-        label: 'Balls per player',
+        key: 'points',
+        label: 'Play to',
         type: 'select',
-        default: DEFAULT_BALLS_PER_PLAYER,
-        options: [5, 10, 15].map((n) => ({ value: n, label: String(n) })),
+        default: DEFAULT_POINTS_TO_WIN,
+        options: POINTS_OPTIONS.map((n) => ({ value: n, label: `${n} points` })),
       },
       {
         key: 'speed',
@@ -521,7 +544,7 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
     const players = [...ctx.players].sort((a, b) => a.seat - b.seat).map((p) => p.userId);
     const names: Record<string, string> = {};
     for (const p of ctx.players) names[p.userId] = p.name;
-    const { balls, flightMs } = readSettings(ctx.settings);
+    const { pointsToWin, flightMs } = readSettings(ctx.settings);
 
     const resolvedStudy = resolveStudyLanguages(ctx, players);
     const studyLanguages: Record<string, string> = {};
@@ -540,12 +563,13 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
       hands: {},
       queues: {},
       scores,
+      pointsToWin,
       stage: 'ready',
       stageUntil: null,
       afterPause: 'serve',
       nextServerId: players[0] ?? null,
       ball: null,
-      totalBalls: balls * players.length,
+      wordLimit: WORD_LIMIT,
       flightMs,
       results: {},
       history: [],
@@ -657,7 +681,8 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
       stageRemainingMs: state.stageUntil ? Math.max(0, state.stageUntil - now) : 0,
       nextServerId: state.nextServerId,
       ballNumber: ball?.number ?? 0,
-      totalBalls: state.totalBalls,
+      wordLimit: state.wordLimit,
+      pointsToWin: state.pointsToWin,
       hand,
       opponentHandCount: opponentId ? state.hands[opponentId]?.length ?? 0 : 0,
       // Never the target's id or its study-language word while it flies — only its meaning.
@@ -722,7 +747,7 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
     }
     if (state.stageUntil === null || now < state.stageUntil) return;
     if (state.afterPause === 'finish') {
-      finish(state, 'All balls played. Highest score wins.');
+      finish(state, finalMessage(state));
       return;
     }
     if (state.nextServerId) serve(state, state.nextServerId);

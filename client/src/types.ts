@@ -10,6 +10,7 @@ export type AudioRef = { cardId: string } | { text: string; lang: string };
 export interface PlayerView {
   id: string;
   name: string;
+  /** Points: one for each of the opponent's misses. */
   score: number;
   present: boolean;
 }
@@ -81,8 +82,12 @@ export interface GameState {
   stage: Stage;
   stageRemainingMs: number;
   nextServerId: string | null;
+  /** Words played so far (the ball in play included). */
   ballNumber: number;
-  totalBalls: number;
+  /** Words a match may last before it is decided on points. */
+  wordLimit: number;
+  /** First to this many points wins. */
+  pointsToWin: number;
   hand: HandCard[];
   opponentHandCount: number;
   ball: BallView | null;

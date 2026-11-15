@@ -14,20 +14,20 @@ Translator cards.
 3. The ball flies at you carrying the *meaning* of one of your two cards (in your own language).
    Before it reaches your end of the table, tap the card with the matching word: the card swings
    out to the ball.
-4. **Right card: +1 point**, and the ball bounces straight back to your opponent — already
-   carrying the meaning of one of *their* cards. No pause: it is a rally.
-5. **Wrong card, or too late: no point** (points are never taken away). Your note shows the word
-   you needed; that word comes back a few balls later. Then you serve the next ball.
+4. **Right card:** the ball bounces straight back to your opponent — already carrying the
+   meaning of one of *their* cards. No pause: it is a rally.
+5. **Wrong card, or too late: a point to your opponent.** Your note shows the word you needed;
+   that word comes back a few balls later. Then you serve the next ball.
 6. Either way you get a fresh pair the moment your ball is decided.
-7. The ball always alternates sides, so both players get the same number of balls (default 10
-   each). After the last one the highest score wins. The end screen lists every ball you had to
-   answer, with pronunciation (turn it on with the 🔇 button).
+7. **First to 5 points wins** (3 / 5 / 10 in the lobby). A match also stops after **100 words**:
+   the leader wins, and level scores — say a rally nobody missed — are a draw. The end screen
+   lists every ball you had to answer, with pronunciation (turn it on with the speaker button).
 
 The ball's flight time is the answer window (8 s / 6 s / 4 s for relaxed / normal / fast). It is
 over the net quickly and slows down on your side. Keys `1`/`2` (or ←/→, A/D) swing the left/right
 card.
 
-Match settings (lobby): **Balls per player** 5 / 10 / 15, **Ball speed** relaxed / normal / fast.
+Match settings (lobby): **Play to** 3 / 5 / 10 points, **Ball speed** relaxed / normal / fast.
 A match needs at least 6 words playable in every player's language.
 
 ## Layout

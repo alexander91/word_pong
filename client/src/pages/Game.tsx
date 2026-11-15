@@ -47,12 +47,6 @@ interface Swing {
   to: Point;
 }
 
-interface Burst {
-  key: string;
-  at: Point;
-  outcome: 'hit' | 'wrong';
-}
-
 /** How long a swinging card takes to reach the ball; the ball waits there for it. */
 const CONTACT_MS = 200;
 /** A missed ball rolling off the end of the table. */
@@ -121,7 +115,6 @@ export default function Game({ handoff, session, bridge }: Props) {
   const [swungBall, setSwungBall] = useState<number | null>(null);
   const [swungCardId, setSwungCardId] = useState<string | null>(null);
   const [swings, setSwings] = useState<Swing[]>([]);
-  const [bursts, setBursts] = useState<Burst[]>([]);
   const [chip, setChip] = useState<ResultView | null>(null);
   // Pronunciation is opt-in: silent until the player turns it on (remembered per browser).
   const [soundOn, setSoundOn] = useState(readSoundPref);
@@ -202,39 +195,30 @@ export default function Game({ handoff, session, bridge }: Props) {
   }, [state, bridge]);
 
   const removeSwing = useCallback((key: string) => setSwings((all) => all.filter((s) => s.key !== key)), []);
-  const removeBurst = useCallback((key: string) => setBursts((all) => all.filter((b) => b.key !== key)), []);
 
-  // Freshly decided balls: your note, a flash where the ball was struck, and — on your screen —
-  // the opponent's card swinging out to meet the ball.
+  // Freshly decided balls: your note and — on your screen — the opponent's card swinging out to
+  // meet the ball.
   useLayoutEffect(() => {
     if (!state) return;
-    const ballRect = ballRef.current?.getBoundingClientRect();
-    const ballCenter = ballRect && { x: ballRect.left + ballRect.width / 2, y: ballRect.top + ballRect.height / 2 };
-
     const mine = state.myResult;
     if (mine && mine.ball !== seenResults.current.mine) {
       seenResults.current.mine = mine.ball;
-      if (mine.ageMs < 1_500) {
-        setChip(mine);
-        if (mine.outcome !== 'missed' && ballCenter) {
-          setBursts((all) => [...all, { key: `me-${mine.ball}`, at: ballCenter, outcome: mine.outcome === 'hit' ? 'hit' : 'wrong' }]);
-        }
-      }
+      if (mine.ageMs < 1_500) setChip(mine);
     }
 
     const theirs = state.opponentResult;
     if (theirs && theirs.ball !== seenResults.current.theirs) {
       seenResults.current.theirs = theirs.ball;
+      const ballRect = ballRef.current?.getBoundingClientRect();
       const cards = opponentCardRefs.current.filter((el): el is HTMLDivElement => !!el);
       const card = cards[Math.floor(Math.random() * cards.length)];
-      if (theirs.ageMs < 1_500 && theirs.outcome !== 'missed' && ballRect && ballCenter && card) {
+      if (theirs.ageMs < 1_500 && theirs.outcome !== 'missed' && ballRect && card) {
         setSwings((all) => [...all, {
           key: `opp-${theirs.ball}`,
           side: 'opponent',
           from: card.getBoundingClientRect(),
-          to: { x: ballCenter.x, y: ballRect.top },
+          to: { x: ballRect.left + ballRect.width / 2, y: ballRect.top },
         }]);
-        setBursts((all) => [...all, { key: `opp-${theirs.ball}`, at: ballCenter, outcome: theirs.outcome === 'hit' ? 'hit' : 'wrong' }]);
       }
     }
   }, [state]);
@@ -297,7 +281,6 @@ export default function Game({ handoff, session, bridge }: Props) {
   const opponent = state.players.find((p) => p.id !== state.you);
   const nameOf = (id: string | null) => state.players.find((p) => p.id === id)?.name ?? 'Player';
   const playing = state.phase === 'PLAYING';
-  const waitingOnOpponent = playing && state.stage === 'flight' && ball?.direction === 'outgoing';
 
   return (
     <div className="game">
@@ -306,13 +289,14 @@ export default function Game({ handoff, session, bridge }: Props) {
         me={me}
         opponent={opponent}
         ballNumber={state.ballNumber}
-        totalBalls={state.totalBalls}
+        wordLimit={state.wordLimit}
+        pointsToWin={state.pointsToWin}
         soundOn={soundOn}
         onToggleSound={toggleSound}
       />
 
       <div className="arena">
-        <div className={`paddle paddle-opponent ${waitingOnOpponent ? 'is-thinking' : ''}`} aria-label={`${opponent?.name ?? 'Opponent'}'s cards`}>
+        <div className="paddle paddle-opponent" aria-label={`${opponent?.name ?? 'Opponent'}'s cards`}>
           {Array.from({ length: state.opponentHandCount || 2 }, (_, index) => (
             <div key={index} ref={(el) => { opponentCardRefs.current[index] = el; }} className="word-card is-back" />
           ))}
@@ -330,7 +314,7 @@ export default function Game({ handoff, session, bridge }: Props) {
           {ball && anchor?.id === ball.id && <Ball ballRef={ballRef} ball={ball} anchor={anchor} frozen={frozen} />}
         </div>
 
-        <div className={`paddle paddle-me ${canSwing ? 'is-ready' : ''}`}>
+        <div className="paddle paddle-me">
           {state.hand.map((card, index) => (
             <button
               key={card.id}
@@ -349,18 +333,10 @@ export default function Game({ handoff, session, bridge }: Props) {
         </div>
       </div>
 
-      <StatusLine state={state} opponent={opponent} connError={connError} chip={chip} />
+      <StatusLine state={state} connError={connError} chip={chip} />
 
       <div className="fx-layer" aria-hidden="true">
         {swings.map((s) => <SwingGhost key={s.key} swing={s} onDone={removeSwing} />)}
-        {bursts.map((b) => (
-          <span
-            key={b.key}
-            className={`burst is-${b.outcome}`}
-            style={{ left: b.at.x, top: b.at.y, animationDelay: `${CONTACT_MS}ms` }}
-            onAnimationEnd={() => removeBurst(b.key)}
-          />
-        ))}
       </div>
 
       {state.phase === 'GAME_OVER' && (
@@ -377,11 +353,14 @@ export default function Game({ handoff, session, bridge }: Props) {
 
 // ── header ──────────────────────────────────────────────────────────────────
 
-function Scoreboard({ me, opponent, ballNumber, totalBalls, soundOn, onToggleSound }: {
+/** Points on a red tile (you) and a black one (them), like a courtside flip scoreboard; the
+ *  target and the word count between them. */
+function Scoreboard({ me, opponent, ballNumber, wordLimit, pointsToWin, soundOn, onToggleSound }: {
   me: PlayerView | undefined;
   opponent: PlayerView | undefined;
   ballNumber: number;
-  totalBalls: number;
+  wordLimit: number;
+  pointsToWin: number;
   soundOn: boolean;
   onToggleSound: () => void;
 }) {
@@ -389,29 +368,45 @@ function Scoreboard({ me, opponent, ballNumber, totalBalls, soundOn, onToggleSou
     <header className="scoreboard">
       <div className="score-side is-me">
         <span className="score-name">{me?.name ?? 'You'}</span>
-        <span key={me?.score} className="score-value">{me?.score ?? 0}</span>
+        <span className="score-value" aria-label={`Your points: ${me?.score ?? 0}`}>{me?.score ?? 0}</span>
       </div>
       <div className="score-mid">
-        <span className="score-mid-label">Ball</span>
-        <span className="score-mid-value">{ballNumber > 0 ? `${ballNumber} / ${totalBalls}` : `– / ${totalBalls}`}</span>
-        <button
-          type="button"
-          className={`sound-toggle ${soundOn ? 'is-on' : ''}`}
-          onClick={onToggleSound}
-          aria-pressed={soundOn}
-          title={soundOn ? 'Turn pronunciation off' : 'Turn pronunciation on'}
-        >
-          {soundOn ? '🔊' : '🔇'}
-        </button>
+        <span>First to {pointsToWin}</span>
+        <span className="score-words">Word {ballNumber} / {wordLimit}</span>
       </div>
       <div className="score-side is-opponent">
-        <span key={opponent?.score} className="score-value">{opponent?.score ?? 0}</span>
+        <span className="score-value" aria-label={`${opponent?.name ?? 'Opponent'}'s points: ${opponent?.score ?? 0}`}>
+          {opponent?.score ?? 0}
+        </span>
         <span className="score-name">
           {opponent?.name ?? 'Opponent'}
-          {opponent && !opponent.present && <em className="score-away"> · away</em>}
+          {opponent && !opponent.present && <span className="score-away"> away</span>}
         </span>
       </div>
+      <button
+        type="button"
+        className={`sound-toggle ${soundOn ? 'is-on' : ''}`}
+        onClick={onToggleSound}
+        aria-pressed={soundOn}
+        aria-label="Pronunciation"
+        title={soundOn ? 'Pronunciation on' : 'Pronunciation off'}
+      >
+        <SpeakerIcon on={soundOn} />
+      </button>
     </header>
+  );
+}
+
+function SpeakerIcon({ on }: { on: boolean }) {
+  return (
+    <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true" focusable="false">
+      <path d="M3 7.5h3l4-3.5v12l-4-3.5H3z" fill="currentColor" />
+      {on ? (
+        <path d="M13 7a4 4 0 0 1 0 6M15.5 4.5a7.5 7.5 0 0 1 0 11" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      ) : (
+        <path d="M13.5 8l4 4M17.5 8l-4 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      )}
+    </svg>
   );
 }
 
@@ -448,13 +443,12 @@ function Ball({ ballRef, ball, anchor, frozen }: {
   );
 }
 
-/** Your note after each ball: the word you needed, and what you swung if it was wrong. */
+/** Your note after each ball: the word and its meaning, and what you swung if it was wrong. */
 function ResultChip({ result }: { result: ResultView }) {
   const { target, picked, outcome } = result;
   if (!target) return null;
   return (
     <div className={`result-chip is-${outcome}`} role="status">
-      {outcome === 'hit' && <span className="chip-head">+1</span>}
       {outcome === 'wrong' && picked && (
         <span className="chip-line is-wrong">
           <s>{picked.word}</s> <span className="chip-meaning">{picked.prompt}</span>
@@ -510,20 +504,21 @@ function SwingGhost({ swing, onDone }: { swing: Swing; onDone: (key: string) => 
 
 // ── footer + overlay ────────────────────────────────────────────────────────
 
-/** Under your cards: your note on the last ball while it is fresh, otherwise what is going on.
- *  It sits here rather than on the table so it never covers the ball. */
-function StatusLine({ state, opponent, connError, chip }: {
+/** Under your cards: your note on the last ball while it is fresh, otherwise who scored. Quiet
+ *  during a rally — the ball already says what to hit. It sits here rather than on the table so
+ *  it never covers the ball. */
+function StatusLine({ state, connError, chip }: {
   state: GameState;
-  opponent: PlayerView | undefined;
   connError: string | null;
   chip: ResultView | null;
 }) {
   const ball = state.ball;
   let text = state.message;
-  if (state.phase === 'PLAYING' && state.stage === 'flight' && ball?.state === 'flying') {
-    text = ball.direction === 'incoming'
-      ? `Hit it with the word for “${ball.label ?? '…'}”`
-      : `${opponent?.name ?? 'Opponent'} is answering…`;
+  if (state.phase === 'PLAYING' && state.stage === 'ready') {
+    text = `First to ${state.pointsToWin}. You score when the other player misses.`;
+  } else if (state.phase === 'PLAYING' && state.stage === 'flight' && ball?.state === 'flying') {
+    // One hint before your first swing; after that the ball's label is enough.
+    text = ball.direction === 'incoming' && !state.myResult ? `Tap the word for “${ball.label ?? '…'}”` : '';
   }
   return (
     <footer className={`status ${connError ? 'is-error' : ''}`}>
@@ -540,32 +535,42 @@ function GameOver({ state, onPlay, onRematch, onExit }: {
 }) {
   const winner = state.players.find((p) => p.id === state.winnerId);
   const cancelled = state.history.length === 0;
-  const title = cancelled ? 'No match' : !winner ? 'Draw' : winner.id === state.you ? 'You win!' : `${winner.name} wins`;
+  const title = cancelled ? 'No match' : !winner ? 'Draw' : winner.id === state.you ? 'You won' : `${winner.name} won`;
+  const me = state.players.find((p) => p.id === state.you);
+  const opponent = state.players.find((p) => p.id !== state.you);
   const mine = state.history.filter((row) => row.receiverId === state.you);
   const hits = mine.filter((row) => row.outcome === 'hit').length;
+  // Why it ended, when the score alone does not say: the word limit, or someone leaving.
+  const reachedTarget = state.players.some((p) => p.score >= state.pointsToWin);
+  const ending = reachedTarget ? '' : state.ballNumber >= state.wordLimit ? `All ${state.wordLimit} words played.` : state.message;
   return (
     <div className="overlay">
       <div className="overlay-card">
-        <div className={`overlay-title ${winner?.id === state.you ? 'is-win' : ''}`}>{title}</div>
+        <div className="overlay-title">{title}</div>
         {cancelled ? (
           <p className="overlay-text">{state.message}</p>
         ) : (
           <>
             <div className="overlay-scores">
-              {state.players.map((p) => (
-                <span key={p.id} className={p.id === state.you ? 'is-me' : ''}>{p.name} <strong>{p.score}</strong></span>
-              ))}
+              <span className="overlay-name">{me?.name ?? 'You'}</span>
+              <span className="score-value is-me">{me?.score ?? 0}</span>
+              <span className="score-value is-opponent">{opponent?.score ?? 0}</span>
+              <span className="overlay-name">{opponent?.name ?? 'Opponent'}</span>
             </div>
-            <p className="overlay-text">You hit {hits} of {mine.length} balls.</p>
+            <p className="overlay-text">
+              {ending && <>{ending} </>}You returned {hits} of {mine.length}.
+            </p>
             <ul className="review">
               {mine.map((row) => (
                 <li key={row.number} className={`review-row is-${row.outcome}`}>
-                  <span className="review-mark">{row.outcome === 'hit' ? '✓' : '✗'}</span>
+                  <span className="review-mark" aria-label={row.outcome === 'hit' ? 'returned' : 'missed'}>
+                    {row.outcome === 'hit' ? '✓' : '✗'}
+                  </span>
                   <span className="review-word">{row.word}</span>
                   <span className="review-prompt">{row.prompt}</span>
                   {row.audio && (
                     <button type="button" className="review-sound" onClick={() => onPlay(row)} aria-label={`Play ${row.word}`}>
-                      🔊
+                      <SpeakerIcon on />
                     </button>
                   )}
                 </li>
