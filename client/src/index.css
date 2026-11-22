@@ -435,6 +435,8 @@ button.word-card:disabled { color: var(--ink); }
   inset: 0;
   display: grid;
   place-items: center;
+  /* A fixed row: an auto one grows with the card, so its max-height never applies. */
+  grid-template-rows: minmax(0, 1fr);
   padding: 16px;
   background: rgba(15, 20, 26, 0.5);
   z-index: 30;
