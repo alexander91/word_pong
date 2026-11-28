@@ -45,7 +45,8 @@ export interface BallView {
   elapsedMs: number;
   /** Where along its path it was decided (1 = it reached the receiver untouched). */
   contactPos: number | null;
-  /** Incoming: the meaning to answer. Outgoing: the word you sent it with. */
+  /** The meaning the receiver must answer, in this viewer's language — incoming, yours to
+   *  answer; outgoing, what your opponent is being asked. */
   label?: string;
 }
 

@@ -74,8 +74,6 @@ interface Ball {
   toId: string;
   /** The receiver's hand card whose meaning the ball carries. */
   targetId: string;
-  /** The sender's card that sent it back (shown on the sender's side); null for a serve. */
-  carriedId: string | null;
   startedAt: number;
   durationMs: number;
   startPos: number;
@@ -389,7 +387,7 @@ function opponentOf(state: PongState, playerId: string): string | null {
 function launch(
   state: PongState,
   fromId: string,
-  from: { carriedId: string | null; startPos: number; startX: number },
+  from: { startPos: number; startX: number },
 ): void {
   const toId = opponentOf(state, fromId);
   const targetId = toId ? pick(state.hands[toId] ?? []) : undefined;
@@ -399,7 +397,6 @@ function launch(
     fromId,
     toId,
     targetId,
-    carriedId: from.carriedId,
     startedAt: Date.now(),
     durationMs: state.flightMs,
     startPos: from.startPos,
@@ -414,7 +411,7 @@ function launch(
 }
 
 function serve(state: PongState, fromId: string): void {
-  launch(state, fromId, { carriedId: null, startPos: 0, startX: 50 });
+  launch(state, fromId, { startPos: 0, startX: 50 });
   state.message = `${nameOf(state, fromId)} serves.`;
 }
 
@@ -447,7 +444,6 @@ function decide(state: PongState, outcome: Outcome, pickedId: string | null): vo
   if (outcome === 'hit' && !last) {
     // Reflect: the return leaves from where the ball was hit, on the hitter's side of the net.
     launch(state, receiverId, {
-      carriedId: ball.targetId,
       startPos: 1 - ball.contactPos,
       startX: xAt(ball, progress),
     });
@@ -633,11 +629,9 @@ export const wordPongModule: GameModule<PongState, PongAction> = {
     if (ball && state.phase === 'PLAYING' && state.stage !== 'ready') {
       const incoming = ball.toId === playerId;
       const target = state.concepts[ball.targetId];
-      const carried = ball.carriedId ? state.concepts[ball.carriedId] : undefined;
-      // Coming at you: the meaning you must answer. Going away: the word you sent it with.
-      const label = incoming
-        ? target && promptFor(target, base)
-        : carried && (wordFor(carried, lang)?.word ?? carried.english);
+      // Both ends read the meaning the receiver must answer, each in their own language: coming
+      // at you it is your question; going away it shows what your opponent is being asked.
+      const label = target && promptFor(target, base);
       ballView = {
         id: ball.number,
         direction: incoming ? 'incoming' : 'outgoing',

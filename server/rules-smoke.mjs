@@ -58,10 +58,11 @@ const swing = (s, cardId) => game.applyAction(s, s.ball.toId, { action: 'hit', p
   assert.equal(benView.ball.label, s.concepts[target(s)].english);
   assert(!JSON.stringify(benView.ball).includes(target(s)));
   assert(benView.hand.every((card) => card.prompt === undefined));
-  // The server sees a plain ball leave (it was a serve, nothing was hit).
+  // The server watches the same meaning fly away, so Ann sees what Ben is being asked.
   const annView = game.viewFor(s, 'u1');
   assert.equal(annView.ball.direction, 'outgoing');
-  assert.equal(annView.ball.label, undefined);
+  assert.equal(annView.ball.label, s.concepts[target(s)].english);
+  assert(!JSON.stringify(annView.ball).includes(target(s)));
 
   // Only the receiver can swing.
   game.applyAction(s, 'u1', { action: 'hit', payload: { cardId: s.hands.u1[0] } });
@@ -78,14 +79,14 @@ const swing = (s, cardId) => game.applyAction(s, s.ball.toId, { action: 'hit', p
   assert.equal(s.ball.number, 2);
   assert.equal(s.ball.fromId, 'u2');
   assert.equal(s.ball.toId, 'u1');
-  assert.equal(s.ball.carriedId, hitWith);
   const contact = travel(0.5); // ball 1 started at the far end
   assert(Math.abs(s.ball.startPos - (1 - contact)) < 0.02, `return starts at the contact point (${s.ball.startPos})`);
-  // Ben got a fresh pair and sees his hit word on the ball going away, plus his feedback.
+  // Ben got a fresh pair and, on the ball going away, the meaning Ann now has to answer.
   assert.notDeepEqual(s.hands.u2, oldHand);
   const after = game.viewFor(s, 'u2');
   assert.equal(after.ball.direction, 'outgoing');
-  assert.equal(after.ball.label, s.concepts[hitWith].wordByLang.ru.word);
+  assert.equal(after.ball.label, s.concepts[target(s)].english);
+  assert.equal(game.viewFor(s, 'u1').ball.label, after.ball.label);
   assert.equal(after.myResult.outcome, 'hit');
   assert.equal(after.myResult.target.prompt, s.concepts[hitWith].english);
   assert.equal(game.viewFor(s, 'u1').opponentResult.outcome, 'hit');
@@ -224,6 +225,21 @@ function playOut(s, answer) {
   // Own cards are pronounced by card id; translated words by text.
   const annAudio = game.viewFor(s, 'u1').hand.map((c) => c.audio);
   assert(annAudio.every((a) => a && ('cardId' in a || a.lang === 'ru')));
+
+  // Ben reads meanings in German: the ball at him asks in German, while Ann watches the same
+  // question leave in English — never Ben's Greek word.
+  const t = await fresh({
+    players: [
+      { userId: 'u1', name: 'Ann', seat: 0, language: 'ru' },
+      { userId: 'u2', name: 'Ben', seat: 1, language: 'el', baseLanguage: 'de' },
+    ],
+    cards: { u1: deck('ru', 4), u2: deck('el', 4, 2) },
+    translate,
+  });
+  elapse(t); // Ann serves to Ben
+  const asked = t.concepts[target(t)];
+  assert.equal(game.viewFor(t, 'u2').ball.label, `de:${asked.english}`);
+  assert.equal(game.viewFor(t, 'u1').ball.label, asked.english);
 }
 
 // ── the table is turned around for seat 1, so the ball's sideways path is mirrored ──
